@@ -19,6 +19,15 @@ type readyState struct {
 	Connection *WebsocketConnection
 }
 
+// authorizeWaits - pauses between tries to authorize before a websocket
+// attempt, when the failure can pass by itself
+var authorizeWaits = []time.Duration{
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	30 * time.Second,
+}
+
 // WebsocketConnectionHandler - handler of ready connection
 type WebsocketConnectionHandler func(*WebsocketConnection, utils.GracefulContext)
 
@@ -93,17 +102,21 @@ func (manager *WebsocketConnectionManager) RunWithinContext(ctx utils.GracefulCo
 }
 
 func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
-	// Reauthorize if it is not a first try or we assume we don't have a valid token
-	if err := manager.API.MaybeAuthorize(attempt.GetTry() > 1); err != nil {
-		if !IsTemporary(err) {
-			log.Fatal().Err(err).Msg("Unable to authorize")
-		}
-
-		// No network, a timeout or a server error. Fail this attempt, so
-		// that the next one tries again after its cooldown.
-		log.Error().Err(err).Msg("Unable to authorize, will try again")
-		attempt.Fail(err)
+	// Reauthorize if it is not a first try or we assume we don't have a valid token.
+	//
+	// A failure that can pass (no network, a timeout, a server error) is
+	// tried again here, with short pauses. It does not fail the attempt:
+	// the cooldown between failed attempts grows to an hour, and that
+	// would keep the stream down long after the network has come back.
+	force := attempt.GetTry() > 1
+	err := RetryTemporary(attempt.Done(), authorizeWaits, "authorize", func() error {
+		return manager.API.MaybeAuthorize(force)
+	})
+	if errors.Is(err, ErrRetryCancelled) {
 		return
+	}
+	if err != nil {
+		log.Fatal().Err(err).Msg("Unable to authorize")
 	}
 
 	// Remote

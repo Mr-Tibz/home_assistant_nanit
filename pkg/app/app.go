@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,8 +16,9 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// startupAuthorizeWaits - pauses between tries to authorize at start
-var startupAuthorizeWaits = []time.Duration{
+// startupWaits - pauses between tries of a start-up step that failed for a
+// reason that can pass by itself
+var startupWaits = []time.Duration{
 	5 * time.Second,
 	10 * time.Second,
 	20 * time.Second,
@@ -58,20 +60,26 @@ func NewApp(opts Opts) *App {
 
 // Run - application main loop
 func (app *App) Run(ctx utils.GracefulContext) {
-	// Reauthorize if we don't have a token or we assume it is invalid.
+	// Reauthorize if we don't have a token or we assume it is invalid,
+	// and fetch babies info if they are not present in session.
+	//
 	// A failure that can pass, like no network yet after a boot, is tried
 	// again. Any other failure ends the program.
-	if err := client.AuthorizeWithRetry(app.RestClient, false, ctx.Done(), startupAuthorizeWaits); err != nil {
-		if client.IsTemporary(err) {
-			// Cancelled while waiting for the next try
+	for _, step := range []struct {
+		what string
+		run  func() error
+	}{
+		{"authorize", func() error { return app.RestClient.MaybeAuthorize(false) }},
+		{"fetch the baby list", func() error { _, err := app.RestClient.EnsureBabies(); return err }},
+	} {
+		err := client.RetryTemporary(ctx.Done(), startupWaits, step.what, step.run)
+		if errors.Is(err, client.ErrRetryCancelled) {
 			return
 		}
-
-		log.Fatal().Err(err).Msg("Unable to authorize")
+		if err != nil {
+			log.Fatal().Err(err).Msgf("Unable to %v", step.what)
+		}
 	}
-
-	// Fetches babies info if they are not present in session
-	app.RestClient.EnsureBabies()
 
 	// RTMP
 	if app.Opts.RTMP != nil {
@@ -123,7 +131,15 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 }
 
 func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager) {
-	newMessages := app.RestClient.FetchNewMessages(babyUID, app.Opts.EventPolling.MessageTimeout)
+	newMessages, err := app.RestClient.FetchNewMessages(babyUID, app.Opts.EventPolling.MessageTimeout)
+	if err != nil {
+		if !client.IsTemporary(err) {
+			log.Fatal().Err(err).Msg("Unable to fetch messages")
+		}
+
+		// Skip this round. The next one comes after the polling interval.
+		log.Warn().Err(err).Msg("Unable to fetch messages, will try again")
+	}
 
 	for _, msg := range newMessages {
 		switch msg.Type {

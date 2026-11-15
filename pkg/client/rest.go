@@ -82,28 +82,52 @@ type Authorizer interface {
 	MaybeAuthorize(force bool) error
 }
 
-// AuthorizeWithRetry calls MaybeAuthorize until it succeeds. After a
-// temporary failure it waits and tries again: first for waits[0], then for
-// waits[1], and so on, and for the last entry from then on.
+// ErrRetryCancelled - RetryTemporary was told to stop before fn succeeded
+var ErrRetryCancelled = errors.New("cancelled while waiting for the next try")
+
+// defaultRetryWait is used when RetryTemporary gets no list of waits.
+const defaultRetryWait = 30 * time.Second
+
+// RetryTemporary calls fn until it succeeds. After a temporary failure
+// (see TemporaryError) it waits and calls fn again: first after waits[0],
+// then after waits[1], and so on, and after the last entry from then on.
 //
 // It returns nil after a success. It returns the error of a failure that
 // is not temporary at once, because trying again as we are does not help
-// then. It returns the last temporary error when done closes first.
-func AuthorizeWithRetry(a Authorizer, force bool, done <-chan struct{}, waits []time.Duration) error {
+// then. It returns ErrRetryCancelled as soon as done closes, also in the
+// middle of a call of fn; that call then finishes on its own.
+//
+// This is not utils.RunWithPerseverance: that one restarts a long-running
+// handler and counts the time the handler ran against the cooldown. Here
+// the pause always follows the failure in full.
+func RetryTemporary(done <-chan struct{}, waits []time.Duration, what string, fn func() error) error {
 	for try := 0; ; try++ {
-		err := a.MaybeAuthorize(force)
+		result := make(chan error, 1)
+		go func() { result <- fn() }()
+
+		var err error
+		select {
+		case <-done:
+			return ErrRetryCancelled
+		case err = <-result:
+		}
+
 		if err == nil || !IsTemporary(err) {
 			return err
 		}
 
-		wait := waits[utils.MinInt(try, len(waits)-1)]
-		log.Error().Err(err).Str("retry_in", wait.String()).Msg("Unable to authorize, will try again")
+		wait := defaultRetryWait
+		if len(waits) > 0 {
+			wait = waits[utils.MinInt(try, len(waits)-1)]
+		}
+
+		log.Error().Err(err).Str("retry_in", wait.String()).Msgf("Unable to %v, will try again", what)
 
 		timer := time.NewTimer(wait)
 		select {
 		case <-done:
 			timer.Stop()
-			return err
+			return ErrRetryCancelled
 		case <-timer.C:
 		}
 	}
@@ -233,16 +257,24 @@ func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 		return temporary("unable to decode auth response: %w", jsonErr)
 	}
 
+	// The server may retire the old refresh token as soon as it has sent
+	// a new one. Keep the new one whatever else the answer holds.
+	if authResponse.RefreshToken != "" {
+		log.Info().Str("refresh_token", utils.AnonymizeToken(authResponse.RefreshToken, 4)).Msg("Retreived")
+		c.SessionStore.Session.RefreshToken = authResponse.RefreshToken
+	}
+
 	if authResponse.AccessToken == "" {
-		return temporary("auth response carries no access token")
+		c.SessionStore.Save()
+
+		// Not temporary: the server answers in a way this program does
+		// not understand, and asking again would send the credentials
+		// again and again.
+		return errors.New("auth response carries no access token")
 	}
 
 	log.Info().Str("token", utils.AnonymizeToken(authResponse.AccessToken, 4)).Msg("Authorized")
-	log.Info().Str("refresh_token", utils.AnonymizeToken(authResponse.RefreshToken, 4)).Msg("Retreived")
 	c.SessionStore.Session.AuthToken = authResponse.AccessToken
-	if authResponse.RefreshToken != "" {
-		c.SessionStore.Session.RefreshToken = authResponse.RefreshToken
-	}
 	c.SessionStore.Session.AuthTime = time.Now()
 	c.SessionStore.Save()
 
@@ -250,91 +282,116 @@ func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 }
 
 // FetchAuthorized - makes authorized http request
-func (c *NanitClient) FetchAuthorized(req *http.Request, data interface{}) {
+//
+// Use IsTemporary on the returned error to tell a failure that is worth
+// another try from one that is not.
+func (c *NanitClient) FetchAuthorized(req *http.Request, data interface{}) error {
 	for i := 0; i < 2; i++ {
 		if c.SessionStore.Session.AuthToken != "" {
-			req.Header.Set("Authorization", c.SessionStore.Session.AuthToken)
-
-			res, clientErr := myClient.Do(req)
-			if clientErr != nil {
-				log.Fatal().Err(clientErr).Msg("HTTP request failed")
+			unauthorized, err := c.fetchOnce(req, data)
+			if err != nil {
+				return err
 			}
 
-			defer res.Body.Close()
-
-			if res.StatusCode != 401 {
-				if res.StatusCode != 200 {
-					log.Fatal().Int("code", res.StatusCode).Msg("Server responded with unexpected status code")
-				}
-
-				jsonErr := json.NewDecoder(res.Body).Decode(data)
-				if jsonErr != nil {
-					log.Fatal().Err(jsonErr).Msg("Unable to decode response")
-				}
-
-				return
+			if !unauthorized {
+				return nil
 			}
 
 			log.Info().Msg("Token might be expired. Will try to re-authenticate.")
 		}
 
 		if err := c.Authorize(); err != nil {
-			log.Fatal().Err(err).Msg("Unable to authorize")
+			return err
 		}
 	}
 
-	log.Fatal().Msg("Unable to make request due failed authorization (2 attempts).")
+	return errors.New("unable to make request due to failed authorization (2 attempts)")
+}
+
+// fetchOnce sends req with the current token and decodes the answer into
+// data. It reports a 401 answer as unauthorized and not as an error.
+func (c *NanitClient) fetchOnce(req *http.Request, data interface{}) (unauthorized bool, err error) {
+	req.Header.Set("Authorization", c.SessionStore.Session.AuthToken)
+
+	res, clientErr := myClient.Do(req)
+	if clientErr != nil {
+		return false, temporary("HTTP request failed: %w", clientErr)
+	}
+
+	defer res.Body.Close()
+
+	if res.StatusCode == 401 {
+		return true, nil
+	}
+
+	if res.StatusCode != 200 {
+		return false, statusError("HTTP request failed", res.StatusCode)
+	}
+
+	if jsonErr := json.NewDecoder(res.Body).Decode(data); jsonErr != nil {
+		return false, temporary("unable to decode response: %w", jsonErr)
+	}
+
+	return false, nil
 }
 
 // FetchBabies - fetches baby list
-func (c *NanitClient) FetchBabies() []baby.Baby {
+func (c *NanitClient) FetchBabies() ([]baby.Baby, error) {
 	log.Info().Msg("Fetching babies list")
 	req, reqErr := http.NewRequest("GET", c.url("/babies"), nil)
 
 	if reqErr != nil {
-		log.Fatal().Err(reqErr).Msg("Unable to create request")
+		return nil, fmt.Errorf("unable to create request: %w", reqErr)
 	}
 
 	data := new(babiesResponsePayload)
-	c.FetchAuthorized(req, data)
+	if err := c.FetchAuthorized(req, data); err != nil {
+		return nil, err
+	}
 
 	c.SessionStore.Session.Babies = data.Babies
 	c.SessionStore.Save()
-	return data.Babies
+	return data.Babies, nil
 }
 
 // FetchMessages - fetches message list
-func (c *NanitClient) FetchMessages(babyUID string, limit int) []message.Message {
+func (c *NanitClient) FetchMessages(babyUID string, limit int) ([]message.Message, error) {
 	req, reqErr := http.NewRequest("GET", c.url(fmt.Sprintf("/babies/%s/messages?limit=%d", babyUID, limit)), nil)
 
 	if reqErr != nil {
-		log.Fatal().Err(reqErr).Msg("Unable to create request")
+		return nil, fmt.Errorf("unable to create request: %w", reqErr)
 	}
 
 	data := new(messagesResponsePayload)
-	c.FetchAuthorized(req, data)
+	if err := c.FetchAuthorized(req, data); err != nil {
+		return nil, err
+	}
 
-	return data.Messages
+	return data.Messages, nil
 }
 
 // EnsureBabies - fetches baby list if not fetched already
-func (c *NanitClient) EnsureBabies() []baby.Baby {
+func (c *NanitClient) EnsureBabies() ([]baby.Baby, error) {
 	if len(c.SessionStore.Session.Babies) == 0 {
 		return c.FetchBabies()
 	}
 
-	return c.SessionStore.Session.Babies
+	return c.SessionStore.Session.Babies, nil
 }
 
 // FetchNewMessages - fetches 10 newest messages, ignores any messages which were already fetched or which are older than 5 minutes
-func (c *NanitClient) FetchNewMessages(babyUID string, defaultMessageTimeout time.Duration) []message.Message {
-	fetchedMessages := c.FetchMessages(babyUID, 10)
+func (c *NanitClient) FetchNewMessages(babyUID string, defaultMessageTimeout time.Duration) ([]message.Message, error) {
+	fetchedMessages, err := c.FetchMessages(babyUID, 10)
+	if err != nil {
+		return nil, err
+	}
+
 	newMessages := make([]message.Message, 0)
 
 	// return empty [] if there are no fetchedMessages
 	if len(fetchedMessages) == 0 {
 		log.Debug().Msg("No messages fetched")
-		return newMessages
+		return newMessages, nil
 	}
 
 	// sort fetechedMessages starting with most recent
@@ -366,5 +423,5 @@ func (c *NanitClient) FetchNewMessages(babyUID string, defaultMessageTimeout tim
 	log.Debug().Msgf("Found %d new messages", len(filteredMessages))
 	log.Debug().Msgf("%+v\n", filteredMessages)
 
-	return filteredMessages
+	return filteredMessages, nil
 }
