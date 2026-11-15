@@ -378,7 +378,7 @@ func TestRenewRefusedToken(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 
-	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now().Add(-2 * refusedTokenMinAge) })
+	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now().Add(-refusedTokenMinAge - 5*time.Minute) })
 
 	require.NoError(t, c.RenewRefusedToken("an-older-token"))
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.refreshCalls), "the session has moved on from the refused token")

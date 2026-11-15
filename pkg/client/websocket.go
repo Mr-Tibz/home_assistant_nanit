@@ -1,6 +1,7 @@
 package client
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -66,21 +67,27 @@ const reconnectResetThreshold = 60 * time.Second
 // counts as refused, like a handshake that is answered with a refusal
 const shortConnection = 10 * time.Second
 
-// closedByServer reports whether reason says that the server has closed
-// the connection with a close message. A connection that breaks without
-// one, that reaches its idle limit or that cannot be written to has not
-// been refused.
-func closedByServer(reason error) bool {
-	var closeErr *websocket.CloseError
-
-	return errors.As(reason, &closeErr) && closeErr.Code != websocket.CloseAbnormalClosure
+// refusedByClose reports whether reason says that the server has closed
+// the connection with a close message that does not name a normal or a
+// passing cause. A connection that breaks without a close message, that
+// reaches its idle limit or that cannot be written to has not been
+// refused, and neither has one that the server closes because it
+// restarts.
+func refusedByClose(reason error) bool {
+	return websocket.IsUnexpectedCloseError(reason,
+		websocket.CloseNormalClosure,
+		websocket.CloseGoingAway,
+		websocket.CloseAbnormalClosure,
+		websocket.CloseServiceRestart,
+		websocket.CloseTryAgainLater,
+	)
 }
 
 // refusalPauses - extra pause after attempts in a row that the server has
 // refused: none after the first one, refusalPauses[0] after the second
 // one, and so on, the last entry from then on. The server has refused an
 // attempt when it answers the handshake with a 4xx status, or accepts the
-// connection and closes it within shortConnection (see closedByServer).
+// connection and closes it within shortConnection (see refusedByClose).
 //
 // The short pauses of reconnectCooldown are for failures that pass, like
 // an outage of the network. A refusal is an answer, and asking again at
@@ -143,7 +150,7 @@ type WebsocketConnectionManager struct {
 	refusedToken string
 
 	// lastRefusedToken - the last token that the server has refused by
-	// name. A token that is refused for the first time gets no pause.
+	// name. The first refusal of a token gets no pause.
 	lastRefusedToken string
 
 	// refusals - attempts in a row that the server has refused, see
@@ -232,14 +239,6 @@ func (manager *WebsocketConnectionManager) url() string {
 	return fmt.Sprintf("%v/focus/cameras/%v/user_connect", base, manager.CameraUID)
 }
 
-func orDefault(value time.Duration, defaultValue time.Duration) time.Duration {
-	if value == 0 {
-		return defaultValue
-	}
-
-	return value
-}
-
 // noteRefusal records that the server has refused an attempt, see
 // refusalPauses. refusedToken is the token of the attempt when the answer
 // names it as the cause (401, 403), and "" otherwise. It returns the
@@ -248,21 +247,22 @@ func (manager *WebsocketConnectionManager) noteRefusal(refusedToken string) time
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
+	manager.refusals++
+
 	if refusedToken != "" {
 		manager.refusedToken = refusedToken
 
 		if refusedToken != manager.lastRefusedToken {
 			// The first refusal of this token. The next attempt can
-			// repair that with a new token, so it is not held up, and
-			// the row of refusals starts here.
+			// repair that with a new token, so it gets no pause. The
+			// refusal counts all the same: when the server refuses the
+			// new token too, the pauses go on where they were.
 			manager.lastRefusedToken = refusedToken
-			manager.refusals = 1
 
 			return 0
 		}
 	}
 
-	manager.refusals++
 	if manager.refusals < 2 {
 		return 0
 	}
@@ -272,14 +272,14 @@ func (manager *WebsocketConnectionManager) noteRefusal(refusedToken string) time
 		pauses = refusalPauses
 	}
 
-	return pauses[utils.MinInt(manager.refusals-2, len(pauses)-1)]
+	return pauses[min(manager.refusals-2, len(pauses)-1)]
 }
 
 // noteNoRefusal records that an attempt has ended in another way than a
-// refusal: with a connection that lasted, or with a failure that says
-// nothing about the will of the server, like a server error or a network
-// that is down. The refusals are counted in a row, so this starts the
-// count again.
+// refusal: with a connection that lasted, or with a failure that does not
+// show whether the server accepts the connection, like a server error or
+// a network that is down. The refusals are counted in a row, so this
+// starts the count again.
 func (manager *WebsocketConnectionManager) noteNoRefusal() {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
@@ -326,7 +326,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 	conn, refusalPause, err := manager.connect(attempt, token)
 	if err != nil {
-		manager.pauseAfterRefusal(attempt, refusalPause)
+		manager.pauseAfterRefusal(refusalPause)
 
 		select {
 		case <-attempt.Done():
@@ -362,7 +362,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 		conn.read(manager.idleTimeout())
 		close(readDone)
 	}()
-	go conn.ping(orDefault(manager.PingInterval, DefaultPingInterval))
+	go conn.ping(manager.pingInterval())
 
 	var refusalPauseAfter time.Duration
 
@@ -375,7 +375,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 		reason := conn.endReason()
 		log.Error().Err(reason).Msg("Disconnected from server")
 
-		if closedByServer(reason) && time.Since(connected) < shortConnection {
+		if refusedByClose(reason) && time.Since(connected) < shortConnection {
 			refusalPauseAfter = manager.noteRefusal("")
 		} else {
 			manager.noteNoRefusal()
@@ -403,7 +403,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	conn.end(errAttemptEnded)
 	<-readDone
 
-	manager.pauseAfterRefusal(attempt, refusalPauseAfter)
+	manager.pauseAfterRefusal(refusalPauseAfter)
 }
 
 // pauseAfterRefusal waits for pause, see refusalPauses, or until the
@@ -413,7 +413,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 // of pauses for every kind of failure and counts the time of the attempt
 // against it, so this pause takes the place of its pause and does not
 // come on top of it.
-func (manager *WebsocketConnectionManager) pauseAfterRefusal(attempt utils.AttemptContext, pause time.Duration) {
+func (manager *WebsocketConnectionManager) pauseAfterRefusal(pause time.Duration) {
 	if pause <= 0 {
 		return
 	}
@@ -450,7 +450,7 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 	}()
 
 	dialer := websocket.Dialer{
-		HandshakeTimeout: orDefault(manager.HandshakeTimeout, DefaultHandshakeTimeout),
+		HandshakeTimeout: cmp.Or(manager.HandshakeTimeout, DefaultHandshakeTimeout),
 
 		NetDialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
 			netConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
@@ -465,7 +465,14 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 			go func() {
 				select {
 				case <-attempt.Done():
-					netConn.Close()
+					// When both are ready, the handshake is over and
+					// the connection is no longer ours to close: a
+					// handler may still send a last message on it.
+					select {
+					case <-finished:
+					default:
+						netConn.Close()
+					}
 				case <-finished:
 				}
 			}()
@@ -514,12 +521,19 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 	return NewWebsocketConnection(socket), 0, nil
 }
 
+func (manager *WebsocketConnectionManager) pingInterval() time.Duration {
+	return cmp.Or(manager.PingInterval, DefaultPingInterval)
+}
+
+// idleTimeout returns the idle limit, or 0 when it is turned off. The
+// default is DefaultIdleTimeout, or three ping intervals if that is more,
+// so that a longer interval alone gives a pair of values that fit.
 func (manager *WebsocketConnectionManager) idleTimeout() time.Duration {
 	if manager.IdleTimeout < 0 {
 		return 0
 	}
 
-	return orDefault(manager.IdleTimeout, DefaultIdleTimeout)
+	return cmp.Or(manager.IdleTimeout, max(DefaultIdleTimeout, 3*manager.pingInterval()))
 }
 
 // waitForHandlers waits until all handlers have returned, but not longer

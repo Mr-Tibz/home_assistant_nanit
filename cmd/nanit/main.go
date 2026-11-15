@@ -24,14 +24,13 @@ func websocketOpts() app.WebsocketOpts {
 		log.Fatal().Msg("Invalid NANIT_WS_PING_INTERVAL. It must be 1 or more.")
 	}
 
-	// The default idle limit follows the ping interval, so that a change
-	// of the interval alone gives a pair of values that fit
-	defaultIdleTimeout := client.DefaultIdleTimeout
-	if minimum := 3 * opts.PingInterval; defaultIdleTimeout < minimum {
-		defaultIdleTimeout = minimum
+	// Without the setting, the idle limit stays at zero, and the client
+	// works out a default that fits the ping interval
+	if _, found := os.LookupEnv("NANIT_WS_IDLE_TIMEOUT"); !found {
+		return opts
 	}
 
-	opts.IdleTimeout = utils.EnvVarSeconds("NANIT_WS_IDLE_TIMEOUT", defaultIdleTimeout)
+	opts.IdleTimeout = utils.EnvVarSeconds("NANIT_WS_IDLE_TIMEOUT", 0)
 
 	if opts.IdleTimeout == 0 {
 		// 0 turns the idle limit off. In the options, a negative value

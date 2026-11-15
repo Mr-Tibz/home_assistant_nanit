@@ -154,7 +154,10 @@ type testConnection struct {
 func startConnection(t *testing.T, relay *fakeRelay, prepare func(manager *WebsocketConnectionManager)) *testConnection {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
-	setTokenAge(c, 2*refusedTokenMinAge)
+
+	// Old enough to be replaced after a refusal, and young enough to
+	// need no renewal by itself
+	setTokenAge(c, refusedTokenMinAge+5*time.Minute)
 
 	manager := NewWebsocketConnectionManager("baby-1", "camera-1", c, baby.NewStateManager())
 	manager.BaseURL = "ws" + strings.TrimPrefix(relay.server.URL, "http")
@@ -381,18 +384,21 @@ func TestWebsocketStaysWhileThePingsAreAnswered(t *testing.T) {
 }
 
 // A ping of the other end shows that the connection carries data, also
-// when that end answers no ping of ours.
+// when that end has stopped to answer our pings.
 func TestWebsocketStaysWhileTheOtherEndSendsPings(t *testing.T) {
 	relay := newFakeRelay(t)
-	relay.silent.Store(true)
 
 	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
-		manager.PingInterval = time.Hour
+		manager.PingInterval = 20 * time.Millisecond
 		manager.IdleTimeout = 500 * time.Millisecond
 	})
 
 	conn := await(t, tc.ready, "the connection")
 	relayConn := await(t, relay.connections, "the connection at the relay")
+
+	// The idle limit applies from the first answer to a ping
+	require.Eventually(t, func() bool { return atomic.LoadInt32(&relay.pings) >= 1 }, 5*time.Second, 5*time.Millisecond)
+	relay.silent.Store(true)
 
 	stop := time.After(1500 * time.Millisecond)
 
@@ -479,6 +485,32 @@ func TestWebsocketWaitsLongerWhenTheServerKeepsRefusing(t *testing.T) {
 		t.Fatal("a fourth attempt was made without the pause")
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+// A server that closes the connection because it restarts has not refused
+// it, and neither has a connection that breaks or reaches its idle limit.
+func TestWhichEndsOfAConnectionCountAsRefused(t *testing.T) {
+	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseGoingAway}))
+	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseServiceRestart}))
+	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseAbnormalClosure}), "a connection that breaks")
+	assert.False(t, refusedByClose(errors.New("i/o timeout")), "the idle limit")
+	assert.True(t, refusedByClose(&websocket.CloseError{Code: websocket.ClosePolicyViolation}))
+	assert.True(t, refusedByClose(&websocket.CloseError{Code: 4001}), "a code of the service")
+}
+
+// The default idle limit follows the ping interval.
+func TestWebsocketDefaultIdleLimit(t *testing.T) {
+	manager := &WebsocketConnectionManager{}
+	assert.Equal(t, DefaultIdleTimeout, manager.idleTimeout())
+
+	manager.PingInterval = 2 * time.Minute
+	assert.Equal(t, 6*time.Minute, manager.idleTimeout())
+
+	manager.IdleTimeout = 5 * time.Minute
+	assert.Equal(t, 5*time.Minute, manager.idleTimeout())
+
+	manager.IdleTimeout = -1
+	assert.Zero(t, manager.idleTimeout(), "turned off")
 }
 
 // A server that accepts the connection and closes it at once refuses it

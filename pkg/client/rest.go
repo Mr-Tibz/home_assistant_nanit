@@ -212,7 +212,9 @@ func (c *NanitClient) hasFreshToken() bool {
 // was issued is not refused for its age, and one more renewal would not
 // help: it would only use up one more refresh token. This also limits
 // the renewals when the server refuses every token, to one in this time.
-const refusedTokenMinAge = 15 * time.Minute
+// A token is assumed to be good for AuthTokenTimelife, so the server
+// should not refuse one that is younger than this at all.
+const refusedTokenMinAge = 30 * time.Minute
 
 // RenewRefusedToken gets a new auth token in the place of refused, which
 // the server did not accept. It does nothing when the session holds

@@ -272,22 +272,21 @@ func (conn *WebsocketConnection) handleMessage(m *Message) {
 // can stop carrying data without any sign, for example when a router
 // between the two ends restarts. Only the missing data shows that.
 //
-// The limit starts to apply when the first ping or answer to a ping of
-// the other end has arrived. Until then nothing says that the other end
-// takes part in the pings at all, and a camera can be quiet for longer
-// than the limit: without this, such a connection would be ended and made
-// again without end.
+// The limit starts to apply when the first answer to a ping has arrived.
+// Until then nothing says that the other end answers pings at all, and a
+// camera can be quiet for longer than the limit: without this, such a
+// connection would be ended and made again without end.
 func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
-	pingsSeen := false
+	pingsAnswered := false
 
 	extend := func() {
-		if idleTimeout > 0 && pingsSeen {
+		if idleTimeout > 0 && pingsAnswered {
 			conn.socket.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 	}
 
 	conn.socket.SetPongHandler(func(string) error {
-		pingsSeen = true
+		pingsAnswered = true
 		extend()
 		return nil
 	})
@@ -297,7 +296,6 @@ func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
 	// handling here: the connection is broken then, and the next read
 	// reports that.
 	conn.socket.SetPingHandler(func(message string) error {
-		pingsSeen = true
 		extend()
 		conn.socket.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(writeTimeout))
 		return nil
@@ -328,20 +326,22 @@ func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
 	}
 }
 
-// ping sends a websocket ping at every interval until the connection
-// ends. The answers keep an idle connection from reaching its idle limit.
+// ping sends a websocket ping at once and then at every interval, until
+// the connection ends. The answers keep an idle connection from reaching
+// its idle limit, and the first answer starts that limit.
 func (conn *WebsocketConnection) ping(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
+		// A ping that cannot be written needs no handling of its own:
+		// the idle limit ends the connection.
+		conn.socket.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout))
+
 		select {
 		case <-conn.done:
 			return
 		case <-ticker.C:
-			// A ping that cannot be written needs no handling of its
-			// own: the idle limit ends the connection.
-			conn.socket.WriteControl(websocket.PingMessage, nil, time.Now().Add(writeTimeout))
 		}
 	}
 }
