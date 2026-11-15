@@ -122,7 +122,12 @@ func (conn *WebsocketConnection) SendMessage(m *Message) {
 	if err != nil {
 		select {
 		case <-conn.done:
-			// The connection has ended already, and its end was reported
+			// The connection has ended already, and its end was
+			// reported. Say what is lost with it. The keep-alive is no
+			// loss.
+			if m.GetType() != Message_KEEPALIVE {
+				log.Warn().Stringer("data", m).Msg("A message was not sent, because the websocket connection has ended")
+			}
 		default:
 			log.Warn().Err(err).Msg("Unable to send a message, closing the websocket")
 			conn.end(fmt.Errorf("unable to send a message: %w", err))
@@ -256,9 +261,9 @@ func (conn *WebsocketConnection) handleMessage(m *Message) {
 // ended.
 //
 // With an idle limit, the connection ends when nothing has arrived for
-// that long: no message and no answer to a ping. A connection can stop
-// carrying data without any sign, for example when a router between the
-// two ends restarts. Only the missing data shows that.
+// that long: no message, no ping and no answer to a ping. A connection
+// can stop carrying data without any sign, for example when a router
+// between the two ends restarts. Only the missing data shows that.
 func (conn *WebsocketConnection) read(idleTimeout time.Duration) error {
 	extend := func() {
 		if idleTimeout > 0 {
@@ -268,6 +273,16 @@ func (conn *WebsocketConnection) read(idleTimeout time.Duration) error {
 
 	conn.socket.SetPongHandler(func(string) error {
 		extend()
+		return nil
+	})
+
+	// A ping of the other end shows as well that the connection carries
+	// data. It is answered, as the library does by itself without this
+	// handler. An answer that cannot be written needs no handling here:
+	// the connection is broken then, and the next read reports that.
+	conn.socket.SetPingHandler(func(message string) error {
+		extend()
+		conn.socket.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(writeTimeout))
 		return nil
 	})
 

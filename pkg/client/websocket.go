@@ -26,7 +26,7 @@ const (
 	DefaultPingInterval = 20 * time.Second
 
 	// DefaultIdleTimeout - a connection on which nothing has arrived for
-	// this long has ended. Three pings fit in it, with room to spare.
+	// this long has ended. It is longer than three ping intervals.
 	DefaultIdleTimeout = 70 * time.Second
 
 	// handlersStopTimeout - time that the handlers of a connection get
@@ -62,17 +62,25 @@ var reconnectCooldown = []time.Duration{
 // and the making of the connection.
 const reconnectResetThreshold = 60 * time.Second
 
-const (
-	// shortConnection - a connection that the other end closes within
-	// this time counts as rejected
-	shortConnection = 10 * time.Second
-
-	// rejectionsBeforeRenewal - after this many rejections in a row, the
-	// token is treated as refused. It is not known how the service
-	// answers every token that it does not accept, so this is the net
-	// under the handshake answers 401 and 403.
-	rejectionsBeforeRenewal = 3
-)
+// refusalPauses - extra pause after handshakes in a row that the server
+// has answered with a refusal (a 4xx status): none after the first one,
+// refusalPauses[0] after the second one, and so on, the last entry from
+// then on.
+//
+// The short pauses of reconnectCooldown are for failures that pass, like
+// an outage of the network. A refusal is an answer, and asking again at
+// once does not change it. After the first one the token is replaced if
+// it can be the cause. When the server refuses again, something else is
+// the cause, for example a camera that the account may no longer use, and
+// asking every 30 seconds for as long as that lasts could get the account
+// blocked.
+var refusalPauses = []time.Duration{
+	30 * time.Second,
+	time.Minute,
+	2 * time.Minute,
+	5 * time.Minute,
+	10 * time.Minute,
+}
 
 // errAttemptEnded - the attempt was told to stop from outside
 var errAttemptEnded = errors.New("the connection attempt was ended")
@@ -108,6 +116,9 @@ type WebsocketConnectionManager struct {
 	// Cooldown - pauses after failed attempts. Nil means the default.
 	Cooldown []time.Duration
 
+	// RefusalPauses - see refusalPauses. Nil means the default.
+	RefusalPauses []time.Duration
+
 	mu               sync.Mutex
 	readyState       *readyState
 	readySubscribers []WebsocketConnectionHandler
@@ -116,9 +127,9 @@ type WebsocketConnectionManager struct {
 	// attempt replaces it first.
 	refusedToken string
 
-	// rejections - attempts in a row that the server has answered and
-	// that gave no lasting connection
-	rejections int
+	// refusals - handshakes in a row that the server has answered with
+	// a refusal
+	refusals int
 }
 
 // NewWebsocketConnectionManager - constructor
@@ -200,34 +211,36 @@ func orDefault(value time.Duration, defaultValue time.Duration) time.Duration {
 	return value
 }
 
-// noteRefusal records that the server has refused token.
-func (manager *WebsocketConnectionManager) noteRefusal(token string) {
+// noteRefusal records that the server has answered the handshake with a
+// refusal. tokenRefused says that the answer names the token as the
+// cause (401, 403). It returns the pause to make before the next attempt.
+func (manager *WebsocketConnectionManager) noteRefusal(token string, tokenRefused bool) time.Duration {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
-	manager.refusedToken = token
-	manager.rejections = 0
-}
-
-// noteRejection records that the server has answered an attempt with
-// token and has given no lasting connection.
-func (manager *WebsocketConnectionManager) noteRejection(token string) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-
-	manager.rejections++
-	if manager.rejections >= rejectionsBeforeRenewal {
+	if tokenRefused {
 		manager.refusedToken = token
-		manager.rejections = 0
 	}
+
+	manager.refusals++
+	if manager.refusals < 2 {
+		return 0
+	}
+
+	pauses := manager.RefusalPauses
+	if pauses == nil {
+		pauses = refusalPauses
+	}
+
+	return pauses[utils.MinInt(manager.refusals-2, len(pauses)-1)]
 }
 
-// noteLastingConnection records that a connection has worked.
-func (manager *WebsocketConnectionManager) noteLastingConnection() {
+// noteConnection records that the server has accepted a handshake.
+func (manager *WebsocketConnectionManager) noteConnection() {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
-	manager.rejections = 0
+	manager.refusals = 0
 }
 
 // takeRefusedToken returns the token that the server has refused since
@@ -267,8 +280,17 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// running and takes the token that it gives.
 	token, _ := manager.API.tokenForRequest()
 
-	conn, err := manager.connect(attempt, token)
+	conn, refusalPause, err := manager.connect(attempt, token)
 	if err != nil {
+		if refusalPause > 0 {
+			log.Warn().Str("pause", refusalPause.String()).Msg("The server has refused the connection again. Waiting before the next attempt")
+
+			select {
+			case <-attempt.Done():
+			case <-time.After(refusalPause):
+			}
+		}
+
 		select {
 		case <-attempt.Done():
 			// Told to stop while connecting: that is not a failure
@@ -279,7 +301,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 		return
 	}
 
-	connected := time.Now()
+	manager.noteConnection()
 	log.Info().Str("url", manager.url()).Msg("Connected to websocket")
 
 	// Start the handlers
@@ -309,12 +331,6 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 		reason := conn.endReason()
 		log.Error().Err(reason).Msg("Disconnected from server")
 
-		if time.Since(connected) < shortConnection {
-			manager.noteRejection(token)
-		} else {
-			manager.noteLastingConnection()
-		}
-
 		manager.BabyStateManager.Update(manager.BabyUID, *baby.NewState().SetWebsocketAlive(false))
 
 		// This also tells the handlers to stop
@@ -339,8 +355,10 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 }
 
 // connect makes the connection. It gives up when the attempt is told to
-// stop, and after the handshake time limit.
-func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext, token string) (*WebsocketConnection, error) {
+// stop, and after the handshake time limit. When the server has refused
+// the connection, it also returns the pause to make before the next
+// attempt.
+func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext, token string) (*WebsocketConnection, time.Duration, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -393,22 +411,21 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 			status = response.StatusCode
 		}
 
-		// Only a refusal of the token leads to a new token at once. A
-		// renewal replaces the refresh token, so it is not done on a
-		// guess. Other refusals of the request are counted.
-		switch {
-		case status == http.StatusUnauthorized || status == http.StatusForbidden:
-			manager.noteRefusal(token)
-		case status >= 400 && status < 500:
-			manager.noteRejection(token)
-		}
-
 		log.Error().Str("url", manager.url()).Int("status", status).Err(err).Msg("Unable to establish websocket connection")
 
-		return nil, err
+		var pause time.Duration
+		if status >= 400 && status < 500 {
+			// Only a refusal of the token leads to a new token. A
+			// renewal replaces the refresh token, so it is not done on
+			// a guess.
+			tokenRefused := status == http.StatusUnauthorized || status == http.StatusForbidden
+			pause = manager.noteRefusal(token, tokenRefused)
+		}
+
+		return nil, pause, err
 	}
 
-	return NewWebsocketConnection(socket), nil
+	return NewWebsocketConnection(socket), 0, nil
 }
 
 func (manager *WebsocketConnectionManager) idleTimeout() time.Duration {

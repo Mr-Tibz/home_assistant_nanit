@@ -219,18 +219,21 @@ const refusedTokenMinAge = 15 * time.Minute
 // another token by now, or when the token is too young to be the cause
 // (see refusedTokenMinAge).
 func (c *NanitClient) RenewRefusedToken(refused string) error {
-	current := c.SessionStore.Snapshot()
+	// The token and the count belong together: an authorization that
+	// ends after this point is seen by authorizeAfter, which then makes
+	// no further one.
+	token, seen := c.tokenForRequest()
 
-	if current.AuthToken != refused {
+	if token != refused {
 		return nil
 	}
 
-	if age := time.Since(current.AuthTime); age < refusedTokenMinAge {
+	if age := time.Since(c.SessionStore.Snapshot().AuthTime); age < refusedTokenMinAge {
 		log.Debug().Str("age", age.String()).Msg("The server has refused a token that is new. It is not renewed again yet")
 		return nil
 	}
 
-	return c.MaybeAuthorize(true)
+	return c.authorizeAfter(seen)
 }
 
 // authorizeAfter performs an authorization. If one has ended since the
