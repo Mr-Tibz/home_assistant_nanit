@@ -39,9 +39,9 @@ jobs:
         run: go test -race -count=1 -timeout 120s ./...
 
   # The published images are built without cgo for several architectures.
-  # Compile and vet for each of the others, test files included, so that
-  # code which only builds on amd64 is caught here and not at release time.
-  # The job above covers amd64.
+  # Vet and link for each of them, test files included, so that code which
+  # only builds on one architecture, or only with cgo, is caught here and
+  # not at release time.
   cross:
     name: Compile for linux/${{ matrix.arch }}
     runs-on: ubuntu-latest
@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ["386", arm, arm64]
+        arch: [amd64, "386", arm, arm64]
     env:
       CGO_ENABLED: "0"
       GOOS: linux
@@ -63,14 +63,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
-        run: go build ./...
-
       - name: Vet
         run: go vet ./...
 
-      # Link the program the way the Dockerfile does. "go build ./..."
-      # compiles every package but throws the result away without linking.
+      # Link the program the way the Dockerfile does.
       - name: Link the program
         run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/*.go
 
