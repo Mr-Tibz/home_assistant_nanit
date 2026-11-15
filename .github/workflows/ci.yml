@@ -62,6 +62,10 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # The cache key of this action does not include the target
+          # architecture, so the matrix jobs would overwrite each other's
+          # entry and restore the wrong one. These builds are small.
+          cache: false
 
       - name: Vet
         run: go vet ./...
