@@ -27,7 +27,7 @@ type WebsocketConnectionManager struct {
 	BabyUID          string
 	CameraUID        string
 	Session          *session.Session
-	API              *NanitClient
+	API              Authorizer
 	BabyStateManager *baby.StateManager
 
 	mu               sync.RWMutex
@@ -36,7 +36,7 @@ type WebsocketConnectionManager struct {
 }
 
 // NewWebsocketConnectionManager - constructor
-func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *session.Session, api *NanitClient, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
+func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *session.Session, api Authorizer, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
 	manager := &WebsocketConnectionManager{
 		BabyUID:          babyUID,
 		CameraUID:        cameraUID,
@@ -94,7 +94,17 @@ func (manager *WebsocketConnectionManager) RunWithinContext(ctx utils.GracefulCo
 
 func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// Reauthorize if it is not a first try or we assume we don't have a valid token
-	manager.API.MaybeAuthorize(attempt.GetTry() > 1)
+	if err := manager.API.MaybeAuthorize(attempt.GetTry() > 1); err != nil {
+		if !IsTemporary(err) {
+			log.Fatal().Err(err).Msg("Unable to authorize")
+		}
+
+		// No network, a timeout or a server error. Fail this attempt, so
+		// that the next one tries again after its cooldown.
+		log.Error().Err(err).Msg("Unable to authorize, will try again")
+		attempt.Fail(err)
+		return
+	}
 
 	// Remote
 	url := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%v/user_connect", manager.CameraUID)

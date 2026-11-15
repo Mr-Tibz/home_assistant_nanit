@@ -12,7 +12,17 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/rtmpserver"
 	"github.com/indiefan/home_assistant_nanit/pkg/session"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
+	"github.com/rs/zerolog/log"
 )
+
+// startupAuthorizeWaits - pauses between tries to authorize at start
+var startupAuthorizeWaits = []time.Duration{
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	40 * time.Second,
+	60 * time.Second,
+}
 
 // App - application container
 type App struct {
@@ -48,8 +58,17 @@ func NewApp(opts Opts) *App {
 
 // Run - application main loop
 func (app *App) Run(ctx utils.GracefulContext) {
-	// Reauthorize if we don't have a token or we assume it is invalid
-	app.RestClient.MaybeAuthorize(false)
+	// Reauthorize if we don't have a token or we assume it is invalid.
+	// A failure that can pass, like no network yet after a boot, is tried
+	// again. Any other failure ends the program.
+	if err := client.AuthorizeWithRetry(app.RestClient, false, ctx.Done(), startupAuthorizeWaits); err != nil {
+		if client.IsTemporary(err) {
+			// Cancelled while waiting for the next try
+			return
+		}
+
+		log.Fatal().Err(err).Msg("Unable to authorize")
+	}
 
 	// Fetches babies info if they are not present in session
 	app.RestClient.EnsureBabies()
