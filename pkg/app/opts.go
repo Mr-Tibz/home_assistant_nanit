@@ -14,6 +14,18 @@ type Opts struct {
 	MQTT             *mqtt.Opts
 	RTMP             *RTMPOpts
 	EventPolling     EventPollingOpts
+	Websocket        WebsocketOpts
+}
+
+// WebsocketOpts - options for the websocket connection to the camera.
+// A zero value means the default of the client package.
+type WebsocketOpts struct {
+	// PingInterval - time between two websocket pings
+	PingInterval time.Duration
+
+	// IdleTimeout - a connection on which nothing has arrived for this
+	// long is given up and made again. Negative turns this off.
+	IdleTimeout time.Duration
 }
 
 // NanitCredentials - user credentials for Nanit account

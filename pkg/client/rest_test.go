@@ -372,40 +372,6 @@ func TestAuthorizeLogsInWhenTheConfiguredRefreshTokenIsRefusedToo(t *testing.T) 
 	assert.Equal(t, "access-login", c.AuthToken())
 }
 
-// The renewal before a new attempt to connect is a precaution. If the
-// server answers it with an error of its own, the caller goes on with the
-// token of the session, as long as that token should still be valid.
-func TestAuthorizeForAttempt(t *testing.T) {
-	for name, tc := range map[string]struct {
-		renew     bool
-		fresh     bool
-		breakIt   func(api *fakeAPI)
-		wantError bool
-	}{
-		"server error, fresh token":      {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, false},
-		"too many requests, fresh token": {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusTooManyRequests }, false},
-		"server error, old token":        {true, false, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, true},
-		"no answer, fresh token":         {true, true, func(api *fakeAPI) { api.server.Close() }, true},
-		"refusal, fresh token":           {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusBadRequest }, true},
-		"renewal works":                  {true, true, func(api *fakeAPI) {}, false},
-		"no renewal asked, old token":    {false, false, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, true},
-		"no renewal asked, fresh token":  {false, true, func(api *fakeAPI) { api.server.Close() }, false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			api := newFakeAPI(t)
-			c := newTestClient(t, api)
-			if tc.fresh {
-				c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now() })
-			}
-			tc.breakIt(api)
-
-			err := c.AuthorizeForAttempt(tc.renew)
-
-			assert.Equal(t, tc.wantError, err != nil, "got: %v", err)
-		})
-	}
-}
-
 // The answer to a login normally carries a new refresh token. If it does
 // not, the refresh token that the server has just refused is dropped, so
 // that the next authorization does not send it again.

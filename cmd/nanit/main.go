@@ -8,9 +8,32 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/indiefan/home_assistant_nanit/pkg/app"
+	"github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/indiefan/home_assistant_nanit/pkg/mqtt"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 )
+
+// websocketOpts reads the settings of the websocket connection to the
+// camera.
+func websocketOpts() app.WebsocketOpts {
+	opts := app.WebsocketOpts{
+		PingInterval: utils.EnvVarSeconds("NANIT_WS_PING_INTERVAL", client.DefaultPingInterval),
+		IdleTimeout:  utils.EnvVarSeconds("NANIT_WS_IDLE_TIMEOUT", client.DefaultIdleTimeout),
+	}
+
+	if opts.PingInterval <= 0 {
+		log.Fatal().Msg("Invalid NANIT_WS_PING_INTERVAL. It must be 1 or more.")
+	}
+
+	if opts.IdleTimeout == 0 {
+		// 0 turns the idle limit off
+		opts.IdleTimeout = -1
+	} else if opts.IdleTimeout <= opts.PingInterval {
+		log.Fatal().Msg("Invalid NANIT_WS_IDLE_TIMEOUT. It must be longer than NANIT_WS_PING_INTERVAL, or 0 to turn it off.")
+	}
+
+	return opts
+}
 
 func main() {
 	initLogger()
@@ -35,6 +58,7 @@ func main() {
 			// 300 second (5 min) default message timeout (unseen messages are ignored once they are this old)
 			MessageTimeout: utils.EnvVarSeconds("NANIT_EVENTS_MESSAGE_TIMEOUT", 300*time.Second),
 		},
+		Websocket: websocketOpts(),
 	}
 
 	if utils.EnvVarBool("NANIT_RTMP_ENABLED", true) {

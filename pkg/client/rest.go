@@ -41,10 +41,6 @@ const defaultAPIBaseURL = "https://api.nanit.com"
 // an error in the log each time, and does not end the program.
 type TemporaryError struct {
 	Err error
-
-	// Status - HTTP status of the answer, when the failure is an answer
-	// of the server. 0 when no answer has arrived.
-	Status int
 }
 
 func (e *TemporaryError) Error() string { return e.Err.Error() }
@@ -67,7 +63,7 @@ func statusError(what string, code int) error {
 	err := fmt.Errorf("%v: server responded with status code %v", what, code)
 
 	if code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
-		return &TemporaryError{Err: err, Status: code}
+		return &TemporaryError{Err: err}
 	}
 
 	return err
@@ -209,27 +205,6 @@ func (c *NanitClient) hasFreshToken() bool {
 	current := c.SessionStore.Snapshot()
 
 	return current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife
-}
-
-// AuthorizeForAttempt - authorization before an attempt to connect.
-//
-// A caller sets renew when its attempt before this one failed: the token
-// may have been the cause, so a new one is asked for although the token
-// of the session should still be valid. That renewal is a precaution. If
-// the server answers it with an error of its own (5xx, 408, 429), the
-// network works and the token of the session may well be good, so the
-// caller goes on with that token. Without this, a renewal service that is
-// down would keep every camera from connecting for as long as it is down.
-func (c *NanitClient) AuthorizeForAttempt(renew bool) error {
-	err := c.MaybeAuthorize(renew)
-
-	var temporary *TemporaryError
-	if renew && errors.As(err, &temporary) && temporary.Status != 0 && c.hasFreshToken() {
-		log.Warn().Err(err).Msg("Unable to renew the auth token. Going on with the token of the session, which should still be valid")
-		return nil
-	}
-
-	return err
 }
 
 // authorizeAfter performs an authorization. If one has ended since the
