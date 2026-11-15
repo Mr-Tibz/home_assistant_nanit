@@ -122,7 +122,10 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 	// Remote
 	url := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%v/user_connect", manager.CameraUID)
-	auth := fmt.Sprintf("Bearer %v", manager.API.AuthToken())
+	// Like a request, the attempt waits for an authorization that is
+	// running and takes the token that it gives.
+	token, _ := manager.API.tokenForRequest()
+	auth := fmt.Sprintf("Bearer %v", token)
 
 	// Local
 	// url := "wss://192.168.3.195:442"

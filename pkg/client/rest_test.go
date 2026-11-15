@@ -25,8 +25,11 @@ type fakeAPI struct {
 
 	refreshStatus int
 	refreshBody   string
-	refreshCalls  int32
-	lastRefresh   atomic.Value // refresh token of the last request
+	// refreshStatusFor - status for a given refresh token. It takes
+	// precedence over refreshStatus.
+	refreshStatusFor map[string]int
+	refreshCalls     int32
+	lastRefresh      atomic.Value // refresh token of the last request
 
 	// rotate - behave like the real server: accept a refresh token once
 	// and answer with a new pair of tokens. A refresh token that was used
@@ -94,6 +97,11 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 
 		if api.rotate {
 			api.rotateTokens(w, body["refresh_token"])
+			return
+		}
+
+		if status, found := api.refreshStatusFor[body["refresh_token"]]; found {
+			w.WriteHeader(status)
 			return
 		}
 
@@ -345,6 +353,23 @@ func TestAuthorizeTriesTheConfiguredRefreshTokenAfterTheOneOfTheSession(t *testi
 	assert.EqualValues(t, 2, atomic.LoadInt32(&api.refreshCalls), "the token of the session first, then the configured one")
 	assert.Equal(t, "rotated-refresh-1", c.SessionStore.Snapshot().RefreshToken)
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
+}
+
+// The configured token is a second chance only. When the server refuses
+// it for any reason, the login is still tried.
+func TestAuthorizeLogsInWhenTheConfiguredRefreshTokenIsRefusedToo(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	c.RefreshToken = "malformed"
+
+	// The token of the session gets 404, the configured one 400
+	api.refreshStatusFor = map[string]int{"refresh-1": http.StatusNotFound, "malformed": http.StatusBadRequest}
+
+	require.NoError(t, c.authorize())
+
+	assert.EqualValues(t, 2, atomic.LoadInt32(&api.refreshCalls))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.loginCalls))
+	assert.Equal(t, "access-login", c.AuthToken())
 }
 
 // The renewal before a new attempt to connect is a precaution. If the

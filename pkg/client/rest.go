@@ -273,29 +273,37 @@ func (c *NanitClient) authorize() error {
 		refreshTokens = append(refreshTokens, c.RefreshToken)
 	}
 
-	hadRefreshToken := false
+	tried := 0
 
 	for _, refreshToken := range refreshTokens {
 		if refreshToken == "" {
 			continue
 		}
 
-		hadRefreshToken = true
+		tried++
 
 		err := c.renewSession(refreshToken) // We have a refresh token, so we'll use that to extend our session
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, ErrExpiredRefreshToken) {
-			return err
+		if errors.Is(err, ErrExpiredRefreshToken) {
+			continue
 		}
+		if tried > 1 && !IsTemporary(err) {
+			// The configured token was a second chance only. Whatever
+			// the server has against it, the login is still open.
+			log.Warn().Err(err).Msg("The configured refresh token was not accepted either")
+			continue
+		}
+
+		return err
 	}
 
 	// We don't have a refresh token, e.g. initial login so we need to supply username/password
 	if c.Email == "" || c.Password == "" {
 		// A login without them cannot work, and its refusal would hide
 		// the cause.
-		if hadRefreshToken {
+		if tried > 0 {
 			return errors.New("the refresh token is no longer valid, and no e-mail address and password are configured for a login. Get a new refresh token with init-nanit.sh (see the README)")
 		}
 
@@ -339,10 +347,11 @@ func (c *NanitClient) renewSession(refreshToken string) error {
 // caller holds authMutex.
 //
 // This program does not send the e-mail address and the password a second
-// time by itself after the server may have received them: a server that
-// limits logins could answer that by locking the account. Every failure
-// of a login therefore ends the program, as it did before. The one
-// exception is a login for which no connection could be made.
+// time by itself after the server may have received them. Every failure
+// of a login ends the program, as it did before. How often the login is
+// sent again is then up to whatever restarts the program, as before. The
+// one exception is a login for which no connection could be made: that
+// one is tried again here.
 func (c *NanitClient) login() error {
 	log.Info().Str("email", c.Email).Str("password", utils.AnonymizeToken(c.Password, 0)).Msg("Authorizing using user credentials")
 	requestBody, requestBodyErr := json.Marshal(map[string]string{
