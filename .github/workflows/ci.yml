@@ -8,10 +8,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request replaces the older run. Runs on main are
-# never cancelled, so that every merge commit is tested on its own.
+# A newer push to a pull request replaces the older run of that pull
+# request. A push to main gets a group of its own (its commit), so that no
+# run on main is cancelled or dropped and every merge commit is tested.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -35,14 +36,34 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -timeout 120s ./...
 
-      # The published images are built without cgo for several
-      # architectures. Compile for each of them, so that code which only
-      # builds on amd64 is caught here and not at release time.
-      - name: Cross-compile
-        run: |
-          for arch in amd64 386 arm arm64; do
-            echo "linux/$arch"
-            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build ./...
-          done
+  # The published images are built without cgo for several architectures.
+  # Compile and vet for each of them, test files included, so that code
+  # which only builds on amd64 is caught here and not at release time.
+  cross:
+    name: Compile for linux/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, "386", arm, arm64]
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
