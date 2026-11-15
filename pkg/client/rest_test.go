@@ -372,6 +372,25 @@ func TestAuthorizeLogsInWhenTheConfiguredRefreshTokenIsRefusedToo(t *testing.T) 
 	assert.Equal(t, "access-login", c.AuthToken())
 }
 
+// A token that the server has refused is replaced, unless the session
+// holds another token by now, or the token is too new to be the cause.
+func TestRenewRefusedToken(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+
+	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now().Add(-2 * refusedTokenMinAge) })
+
+	require.NoError(t, c.RenewRefusedToken("an-older-token"))
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.refreshCalls), "the session has moved on from the refused token")
+
+	require.NoError(t, c.RenewRefusedToken("access-1"))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls))
+	assert.Equal(t, "access-2", c.AuthToken())
+
+	require.NoError(t, c.RenewRefusedToken("access-2"))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "a token that is refused when new is not the cause")
+}
+
 // The answer to a login normally carries a new refresh token. If it does
 // not, the refresh token that the server has just refused is dropped, so
 // that the next authorization does not send it again.

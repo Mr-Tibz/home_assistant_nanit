@@ -181,24 +181,24 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 	// Reading sensor data
 	conn.RegisterMessageHandler(func(m *client.Message, conn *client.WebsocketConnection) {
 		// Sensor request initiated by us on start (or some other client, we don't care)
-		if *m.Type == client.Message_RESPONSE && m.Response != nil {
-			if *m.Response.RequestType == client.RequestType_GET_SENSOR_DATA && len(m.Response.SensorData) > 0 {
+		if m.GetType() == client.Message_RESPONSE && m.Response != nil {
+			if m.Response.GetRequestType() == client.RequestType_GET_SENSOR_DATA && len(m.Response.SensorData) > 0 {
 				processSensorData(babyUID, m.Response.SensorData, app.BabyStateManager)
-			} else if *m.Response.RequestType == client.RequestType_GET_CONTROL && m.Response.Control != nil {
+			} else if m.Response.GetRequestType() == client.RequestType_GET_CONTROL && m.Response.Control != nil {
 				processLight(babyUID, m.Response.Control, app.BabyStateManager)
-			} else if *m.Response.RequestType == client.RequestType_GET_SETTINGS && m.Response.Settings != nil {
+			} else if m.Response.GetRequestType() == client.RequestType_GET_SETTINGS && m.Response.Settings != nil {
 				processStandby(babyUID, m.Response.Settings, app.BabyStateManager)
 			}
 		} else
 
 		// Communication initiated from a cam
 		// Note: it sends the updates periodically on its own + whenever some significant change occurs
-		if *m.Type == client.Message_REQUEST && m.Request != nil {
-			if *m.Request.Type == client.RequestType_PUT_SENSOR_DATA && len(m.Request.SensorData_) > 0 {
+		if m.GetType() == client.Message_REQUEST && m.Request != nil {
+			if m.Request.GetType() == client.RequestType_PUT_SENSOR_DATA && len(m.Request.SensorData_) > 0 {
 				processSensorData(babyUID, m.Request.SensorData_, app.BabyStateManager)
-			} else if *m.Request.Type == client.RequestType_PUT_CONTROL && m.Request.Control != nil {
+			} else if m.Request.GetType() == client.RequestType_PUT_CONTROL && m.Request.Control != nil {
 				processLight(babyUID, m.Request.Control, app.BabyStateManager)
-			} else if *m.Request.Type == client.RequestType_PUT_SETTINGS && m.Request.Settings != nil {
+			} else if m.Request.GetType() == client.RequestType_PUT_SETTINGS && m.Request.Settings != nil {
 				processStandby(babyUID, m.Request.Settings, app.BabyStateManager)
 			}
 		}

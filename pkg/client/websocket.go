@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -56,10 +56,23 @@ var reconnectCooldown = []time.Duration{
 	30 * time.Second,
 }
 
-// reconnectResetThreshold - an attempt that lasted this long had a
-// working connection. When it ends, the next attempt starts at once and
-// counts as the first one.
+// reconnectResetThreshold - when an attempt that lasted this long ends,
+// the next attempt starts at once and counts as the first one. The time
+// counts from the start of the attempt, so it includes the authorization
+// and the making of the connection.
 const reconnectResetThreshold = 60 * time.Second
+
+const (
+	// shortConnection - a connection that the other end closes within
+	// this time counts as rejected
+	shortConnection = 10 * time.Second
+
+	// rejectionsBeforeRenewal - after this many rejections in a row, the
+	// token is treated as refused. It is not known how the service
+	// answers every token that it does not accept, so this is the net
+	// under the handshake answers 401 and 403.
+	rejectionsBeforeRenewal = 3
+)
 
 // errAttemptEnded - the attempt was told to stop from outside
 var errAttemptEnded = errors.New("the connection attempt was ended")
@@ -99,9 +112,13 @@ type WebsocketConnectionManager struct {
 	readyState       *readyState
 	readySubscribers []WebsocketConnectionHandler
 
-	// tokenRefused - the server has refused the token at the last
-	// handshake, so the next attempt asks for a new one first
-	tokenRefused atomic.Bool
+	// refusedToken - the token that the server has refused. The next
+	// attempt replaces it first.
+	refusedToken string
+
+	// rejections - attempts in a row that the server has answered and
+	// that gave no lasting connection
+	rejections int
 }
 
 // NewWebsocketConnectionManager - constructor
@@ -183,15 +200,61 @@ func orDefault(value time.Duration, defaultValue time.Duration) time.Duration {
 	return value
 }
 
+// noteRefusal records that the server has refused token.
+func (manager *WebsocketConnectionManager) noteRefusal(token string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	manager.refusedToken = token
+	manager.rejections = 0
+}
+
+// noteRejection records that the server has answered an attempt with
+// token and has given no lasting connection.
+func (manager *WebsocketConnectionManager) noteRejection(token string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	manager.rejections++
+	if manager.rejections >= rejectionsBeforeRenewal {
+		manager.refusedToken = token
+		manager.rejections = 0
+	}
+}
+
+// noteLastingConnection records that a connection has worked.
+func (manager *WebsocketConnectionManager) noteLastingConnection() {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	manager.rejections = 0
+}
+
+// takeRefusedToken returns the token that the server has refused since
+// the last call, or "".
+func (manager *WebsocketConnectionManager) takeRefusedToken() string {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+
+	refused := manager.refusedToken
+	manager.refusedToken = ""
+
+	return refused
+}
+
 func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// Reauthorize if we assume we don't have a valid token, or if the
-	// server has refused the token at the last handshake.
+	// server has refused the token.
 	//
 	// A failure that can pass (no network, a timeout, a server error) is
 	// tried again here, with short pauses, and does not fail the attempt.
-	renew := manager.tokenRefused.Swap(false)
+	refused := manager.takeRefusedToken()
 	err := RetryTemporary(attempt.Done(), authorizeWaits, "authorize", func() error {
-		return manager.API.MaybeAuthorize(renew)
+		if refused != "" {
+			return manager.API.RenewRefusedToken(refused)
+		}
+
+		return manager.API.MaybeAuthorize(false)
 	})
 	if errors.Is(err, ErrRetryCancelled) {
 		return
@@ -216,6 +279,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 		return
 	}
 
+	connected := time.Now()
 	log.Info().Str("url", manager.url()).Msg("Connected to websocket")
 
 	// Start the handlers
@@ -238,16 +302,24 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 	select {
 	case <-attempt.Done():
-		// Told to stop. The connection still works.
+		// Told to stop. The connection still works, and the state says
+		// so until the handlers have finished: a handler may send a last
+		// message only on a connection that is alive.
 	case <-conn.Done():
 		reason := conn.endReason()
 		log.Error().Err(reason).Msg("Disconnected from server")
 
+		if time.Since(connected) < shortConnection {
+			manager.noteRejection(token)
+		} else {
+			manager.noteLastingConnection()
+		}
+
+		manager.BabyStateManager.Update(manager.BabyUID, *baby.NewState().SetWebsocketAlive(false))
+
 		// This also tells the handlers to stop
 		attempt.Fail(reason)
 	}
-
-	manager.BabyStateManager.Update(manager.BabyUID, *baby.NewState().SetWebsocketAlive(false))
 
 	// No handler is started for this connection from here on
 	manager.mu.Lock()
@@ -258,6 +330,8 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// Let the handlers finish before the socket is closed: a handler may
 	// have a last message to send, for example to stop the stream.
 	waitForHandlers(handlers, handlersStopTimeout)
+
+	manager.BabyStateManager.Update(manager.BabyUID, *baby.NewState().SetWebsocketAlive(false))
 
 	log.Debug().Msg("Closing websocket")
 	conn.end(errAttemptEnded)
@@ -270,17 +344,41 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// finished - connect has returned, with or without a connection
+	finished := make(chan struct{})
+	defer close(finished)
+
 	go func() {
 		select {
 		case <-attempt.Done():
 			cancel()
-		case <-ctx.Done():
+		case <-finished:
 		}
 	}()
 
 	dialer := websocket.Dialer{
-		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: orDefault(manager.HandshakeTimeout, DefaultHandshakeTimeout),
+
+		NetDialContext: func(ctx context.Context, network string, addr string) (net.Conn, error) {
+			netConn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+
+			// The websocket library looks at the context only until
+			// the TCP connection is there. Closing that connection
+			// also ends the TLS handshake and the wait for the answer
+			// of the server, so a stop does not wait for their limit.
+			go func() {
+				select {
+				case <-attempt.Done():
+					netConn.Close()
+				case <-finished:
+				}
+			}()
+
+			return netConn, nil
+		},
 	}
 
 	header := http.Header{}
@@ -295,10 +393,14 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 			status = response.StatusCode
 		}
 
-		// Only a refusal of the token leads to a new token. A renewal
-		// replaces the refresh token, so it is not done on a guess.
-		if status == http.StatusUnauthorized || status == http.StatusForbidden {
-			manager.tokenRefused.Store(true)
+		// Only a refusal of the token leads to a new token at once. A
+		// renewal replaces the refresh token, so it is not done on a
+		// guess. Other refusals of the request are counted.
+		switch {
+		case status == http.StatusUnauthorized || status == http.StatusForbidden:
+			manager.noteRefusal(token)
+		case status >= 400 && status < 500:
+			manager.noteRejection(token)
 		}
 
 		log.Error().Str("url", manager.url()).Int("status", status).Err(err).Msg("Unable to establish websocket connection")

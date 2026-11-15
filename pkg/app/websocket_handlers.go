@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"time"
 
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
@@ -48,6 +49,12 @@ func requestLocalStreaming(babyUID string, targetURL string, streamingStatus cli
 		})
 
 		_, err := awaitResponse(30 * time.Second)
+
+		if errors.Is(err, client.ErrConnectionClosed) {
+			// The connection has ended, so this says nothing about the
+			// stream. The handlers of the next connection ask again.
+			return
+		}
 
 		if err != nil {
 			if err.Error() == "Forbidden: Number of Mobile App connections above limit, declining connection" {

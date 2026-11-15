@@ -2,6 +2,7 @@ package client
 
 import (
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,9 @@ type fakeRelay struct {
 	// silent - accept connections, but never read from them. Such a
 	// connection answers no ping, like one whose other end is gone.
 	silent bool
+
+	// closeAtOnce - close this many accepted connections right away
+	closeAtOnce int32
 
 	// tokens - Authorization header of each handshake
 	tokens chan string
@@ -69,6 +73,11 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 
 		socket, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
+			return
+		}
+
+		if atomic.AddInt32(&relay.closeAtOnce, -1) >= 0 {
+			socket.Close()
 			return
 		}
 
@@ -137,7 +146,7 @@ type testConnection struct {
 func startConnection(t *testing.T, relay *fakeRelay, prepare func(manager *WebsocketConnectionManager)) *testConnection {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
-	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now() })
+	setTokenAge(c, 2*refusedTokenMinAge)
 
 	manager := NewWebsocketConnectionManager("baby-1", "camera-1", c, baby.NewStateManager())
 	manager.BaseURL = "ws" + strings.TrimPrefix(relay.server.URL, "http")
@@ -160,6 +169,12 @@ func startConnection(t *testing.T, relay *fakeRelay, prepare func(manager *Webso
 	t.Cleanup(tc.runner.Cancel)
 
 	return tc
+}
+
+// setTokenAge makes the auth token of the session look as if it was
+// issued that long ago.
+func setTokenAge(c *NanitClient, age time.Duration) {
+	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now().Add(-age) })
 }
 
 // websocketAlive reads what the manager has reported about the connection.
@@ -327,9 +342,10 @@ func TestWebsocketStaysWhileThePingsAreAnswered(t *testing.T) {
 	assert.EqualValues(t, 1, atomic.LoadInt32(&relay.handshakes))
 }
 
-// Only a refusal of the token at the handshake leads to a new token. A
-// renewal replaces the refresh token, so it is not done on a guess.
-func TestWebsocketRenewsTheTokenOnlyAfterItWasRefused(t *testing.T) {
+// Only a refusal of the token at the handshake leads to a new token at
+// once. A renewal replaces the refresh token, so it is not done on a
+// guess.
+func TestWebsocketRenewsTheTokenAfterItWasRefused(t *testing.T) {
 	for name, tc := range map[string]struct {
 		status    int
 		wantToken string
@@ -338,6 +354,7 @@ func TestWebsocketRenewsTheTokenOnlyAfterItWasRefused(t *testing.T) {
 		"unauthorized": {http.StatusUnauthorized, "Bearer access-2", 1},
 		"forbidden":    {http.StatusForbidden, "Bearer access-2", 1},
 		"server error": {http.StatusBadGateway, "Bearer access-1", 0},
+		"bad request":  {http.StatusBadRequest, "Bearer access-1", 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			relay := newFakeRelay(t)
@@ -354,24 +371,81 @@ func TestWebsocketRenewsTheTokenOnlyAfterItWasRefused(t *testing.T) {
 	}
 }
 
+// When the server refuses every token, the cause is not the token. One
+// renewal is made, and then no further one while the new token is young.
+// Before, every attempt after a failed one made a renewal.
+func TestWebsocketDoesNotRenewATokenThatIsRefusedWhenNew(t *testing.T) {
+	relay := newFakeRelay(t)
+	relay.handshakeStatuses = []int{401, 401, 401, 401, 401}
+
+	conn := startConnection(t, relay, nil)
+
+	assert.Equal(t, "Bearer access-1", await(t, relay.tokens, "the first handshake"))
+	for i := 0; i < 4; i++ {
+		assert.Equal(t, "Bearer access-2", await(t, relay.tokens, "a later handshake"))
+	}
+
+	await(t, conn.ready, "the connection")
+	assert.EqualValues(t, 1, atomic.LoadInt32(&conn.api.refreshCalls))
+}
+
+// It is not known how the service answers every token that it does not
+// accept. Three attempts in a row that the server answers without a
+// lasting connection therefore count as a refusal of the token.
+func TestWebsocketRenewsTheTokenAfterRepeatedRejections(t *testing.T) {
+	t.Run("handshakes refused with another status", func(t *testing.T) {
+		relay := newFakeRelay(t)
+		relay.handshakeStatuses = []int{400, 400, 400}
+
+		conn := startConnection(t, relay, nil)
+
+		for i := 0; i < 3; i++ {
+			assert.Equal(t, "Bearer access-1", await(t, relay.tokens, "a refused handshake"))
+		}
+		assert.Equal(t, "Bearer access-2", await(t, relay.tokens, "the handshake after the renewal"))
+
+		await(t, conn.ready, "the connection")
+		assert.EqualValues(t, 1, atomic.LoadInt32(&conn.api.refreshCalls))
+	})
+
+	t.Run("connections closed at once", func(t *testing.T) {
+		relay := newFakeRelay(t)
+		relay.closeAtOnce = 3
+
+		startConnection(t, relay, nil)
+
+		for i := 0; i < 3; i++ {
+			assert.Equal(t, "Bearer access-1", await(t, relay.tokens, "a connection that is closed at once"))
+		}
+		assert.Equal(t, "Bearer access-2", await(t, relay.tokens, "the handshake after the renewal"))
+
+		await(t, relay.connections, "the connection that stays")
+	})
+}
+
 // A handler may have a last message to send when the connection is given
 // up, for example to stop the stream. The socket stays open until the
 // handlers have finished.
 func TestWebsocketLetsTheHandlersFinishBeforeItCloses(t *testing.T) {
 	relay := newFakeRelay(t)
 
+	aliveAtCleanup := make(chan bool, 1)
+
 	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
 		manager.WithReadyConnection(func(conn *WebsocketConnection, ctx utils.GracefulContext) {
 			<-ctx.Done()
+			aliveAtCleanup <- websocketAlive(manager)
 			conn.SendRequest(RequestType_PUT_STREAMING, &Request{})
 		})
 	})
 
 	await(t, tc.ready, "the ready connection")
 	relayConn := await(t, relay.connections, "the connection at the relay")
+	require.Eventually(t, func() bool { return websocketAlive(tc.manager) }, 5*time.Second, 5*time.Millisecond)
 
 	tc.runner.Cancel()
 
+	assert.True(t, await(t, aliveAtCleanup, "the clean up of the handler"), "the state still says that the connection is alive, so the handler sends")
 	assert.Equal(t, RequestType_PUT_STREAMING, relayConn.nextRequest(t).GetType())
 	await(t, relayConn.closed, "the end of the connection")
 	assert.False(t, websocketAlive(tc.manager))
@@ -387,6 +461,43 @@ func TestWebsocketStopsWhileItCannotConnect(t *testing.T) {
 	})
 
 	await(t, relay.tokens, "the first handshake")
+
+	stopped := make(chan struct{})
+	go func() {
+		tc.runner.Cancel()
+		close(stopped)
+	}()
+
+	await(t, stopped, "the stop of the manager")
+}
+
+// A server that takes the connection and then says nothing must not hold
+// up a stop for the time limit of the handshake.
+func TestWebsocketStopsDuringAHandshakeThatHangs(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { listener.Close() })
+
+	accepted := make(chan net.Conn, 4)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- conn
+		}
+	}()
+
+	relay := newFakeRelay(t)
+
+	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
+		manager.BaseURL = "ws://" + listener.Addr().String()
+		manager.HandshakeTimeout = time.Minute
+	})
+
+	hanging := await(t, accepted, "the connection")
+	defer hanging.Close()
 
 	stopped := make(chan struct{})
 	go func() {

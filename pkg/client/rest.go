@@ -207,6 +207,32 @@ func (c *NanitClient) hasFreshToken() bool {
 	return current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife
 }
 
+// refusedTokenMinAge - a token that the server refuses is replaced only
+// when it is at least this old. A token that is refused right after it
+// was issued is not refused for its age, and one more renewal would not
+// help: it would only use up one more refresh token. This also limits
+// the renewals when the server refuses every token, to one in this time.
+const refusedTokenMinAge = 15 * time.Minute
+
+// RenewRefusedToken gets a new auth token in the place of refused, which
+// the server did not accept. It does nothing when the session holds
+// another token by now, or when the token is too young to be the cause
+// (see refusedTokenMinAge).
+func (c *NanitClient) RenewRefusedToken(refused string) error {
+	current := c.SessionStore.Snapshot()
+
+	if current.AuthToken != refused {
+		return nil
+	}
+
+	if age := time.Since(current.AuthTime); age < refusedTokenMinAge {
+		log.Debug().Str("age", age.String()).Msg("The server has refused a token that is new. It is not renewed again yet")
+		return nil
+	}
+
+	return c.MaybeAuthorize(true)
+}
+
 // authorizeAfter performs an authorization. If one has ended since the
 // caller read seen from authRuns, it returns the result of that one.
 func (c *NanitClient) authorizeAfter(seen uint64) error {
