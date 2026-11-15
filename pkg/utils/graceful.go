@@ -55,7 +55,17 @@ func newGracefulRunner(ctx *gracefulCtx) *gracefulRunner {
 
 func (runner *gracefulRunner) Wait() (bool, error) {
 	runner.ctx.wg.Wait()
-	return runner.ctx.err == errCancel, runner.ctx.err
+
+	// Fail() can still run after the handler has returned (a parent that
+	// gets cancelled cancels its children), so read the error under the
+	// same lock that Fail() writes it with. This makes the read safe. It
+	// does not decide which of the two comes first: a child that returns
+	// at the moment its parent is cancelled can report either result.
+	runner.ctx.mutex.Lock()
+	err := runner.ctx.err
+	runner.ctx.mutex.Unlock()
+
+	return err == errCancel, err
 }
 
 func (runner *gracefulRunner) Cancel() {

@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to a pull request replaces the older run of that pull
+# request. A push to main gets a group of its own (its commit), so that no
+# run on main is cancelled or dropped and every merge commit is tested.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  go:
+    name: Build, vet and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # Vet and the tests compile every package, test files included.
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 -timeout 120s ./...
+
+  # The published images are built without cgo for several architectures.
+  # Vet and link for each of them, test files included, so that code which
+  # only builds on one architecture, or only with cgo, is caught here and
+  # not at release time.
+  cross:
+    name: Compile for linux/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, "386", arm, arm64]
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # The cache key of this action does not include the target
+          # architecture, so the matrix jobs would overwrite each other's
+          # entry and restore the wrong one. These builds are small.
+          cache: false
+
+      # The main job already vets amd64.
+      - name: Vet
+        if: matrix.arch != 'amd64'
+        run: go vet ./...
+
+      # Link the program the way the Dockerfile does.
+      - name: Link the program
+        run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/*.go
+
+      # A 386 program runs on the amd64 runner, so the tests can run on a
+      # 32-bit target too. The race detector does not exist for 386.
+      - name: Test (32-bit)
+        if: matrix.arch == '386'
+        run: go test -count=1 -timeout 120s ./...
