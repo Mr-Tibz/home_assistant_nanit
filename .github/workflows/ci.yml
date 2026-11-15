@@ -65,7 +65,9 @@ jobs:
           # entry and restore the wrong one. These builds are small.
           cache: false
 
+      # The main job already vets amd64.
       - name: Vet
+        if: matrix.arch != 'amd64'
         run: go vet ./...
 
       # Link the program the way the Dockerfile does.

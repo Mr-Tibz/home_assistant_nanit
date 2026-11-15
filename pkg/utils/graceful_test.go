@@ -234,8 +234,12 @@ func TestGracefulRunnerFail(t *testing.T) {
 	releaseChild := make(chan struct{})
 	childFinished := make(chan struct{})
 
+	childStarted := make(chan struct{})
+	failNow := make(chan struct{})
+
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+			close(childStarted)
 			if !s.await(childCtx.Done()) {
 				return
 			}
@@ -246,7 +250,14 @@ func TestGracefulRunnerFail(t *testing.T) {
 			}
 		})
 
+		if !s.await(failNow) {
+			return
+		}
 		ctx.Fail(failure)
+
+		// Only the first failure counts.
+		ctx.Fail(errors.New("a later failure"))
+
 		if !s.await(ctx.Done()) {
 			return
 		}
@@ -258,6 +269,11 @@ func TestGracefulRunnerFail(t *testing.T) {
 	})
 
 	done, res := wait(runner)
+
+	// Fail only when the child is running and Wait() is already blocked.
+	s.must(childStarted, "the child to start")
+	s.mustStillBlock(done, "Wait() returned before the handler had failed")
+	close(failNow)
 
 	s.must(handlerFailed, "the failure to cancel the handler's own context")
 	s.must(childCancelled, "the failure to cancel the child")
@@ -327,12 +343,7 @@ func TestGracefulChildWaitDuringParentCancel(t *testing.T) {
 		}
 	}
 
+	// For information only. Both orders exercise the read in Wait().
 	t.Logf("child returned first: %d times, cancellation reached it first: %d times", finishedFirst, cancelledFirst)
 
-	// The read in Wait() can only overlap with a write when the
-	// cancellation reaches the child. If that never happened, this run
-	// has not exercised what the test is for.
-	if cancelledFirst == 0 {
-		t.Skip("the cancellation never reached a child before it returned, so nothing was exercised")
-	}
 }
