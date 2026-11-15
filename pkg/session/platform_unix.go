@@ -30,3 +30,16 @@ func keepOwner(f *os.File, existing os.FileInfo) error {
 
 	return f.Chown(int(want.Uid), int(want.Gid))
 }
+
+// allocatedSize returns the space that the file takes on the disk, in
+// bytes, or 0 when that is not known.
+func allocatedSize(info os.FileInfo) int64 {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0
+	}
+
+	// Blocks counts units of 512 bytes, whatever the block size of the
+	// file system is.
+	return int64(stat.Blocks) * 512
+}

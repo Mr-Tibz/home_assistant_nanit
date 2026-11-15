@@ -151,16 +151,19 @@ func (store *Store) marshal() ([]byte, error) {
 
 // write puts data in the session file. The caller holds store.fileMu.
 //
-// It replaces the file in one step (see replaceFile). When that fails,
-// for whatever reason, it rewrites the file in place. Not saving at all
-// would be worse: the server may have replaced the refresh token already,
-// and the one in the file is then no longer valid. On a full disk the
-// rewrite in place is also the way that still works, because a file of
-// this size is rewritten without new space on the common file systems.
+// It replaces the file in one step (see replaceFile). When that is not
+// possible, it rewrites the file in place:
 //
-// A cause that lies in the place of the file (see placeRefuses) does not
-// pass, so the following saves rewrite the file in place directly. After
-// any other cause, the next save tries to replace the file again.
+//   - A cause that lies in the place of the file (see placeRefuses) does
+//     not pass. The file is rewritten in place, now and at every
+//     following save.
+//   - Any other cause, such as a full disk, can pass. The file is
+//     rewritten in place for this save, but only if the new content fits
+//     in the space that the file already has. The rewrite then needs no
+//     new space, so it also works on a full disk. Not saving would be
+//     worse: the server may have replaced the refresh token already. If
+//     the content does not fit, the file is left as it is and the failure
+//     is returned. The next save tries to replace the file again.
 func (store *Store) write(data []byte) error {
 	if !store.inPlace {
 		err := replaceFile(store.Filename, data)
@@ -175,12 +178,31 @@ func (store *Store) write(data []byte) error {
 			// would hold the tokens each time and help nothing.
 			store.inPlace = true
 			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file cannot be replaced in one step in this place. It is rewritten in place until the program ends, and a crash in the middle of a save can damage it")
-		default:
+		case fitsInPlace(store.Filename, data):
 			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file could not be replaced in one step. It is rewritten in place for this save")
+		default:
+			return err
 		}
 	}
 
 	return writeFileInPlace(store.Filename, data)
+}
+
+// fitsInPlace reports whether filename exists and has room for data in
+// the space it already takes on the disk. Rewriting it in place then
+// needs no new space.
+func fitsInPlace(filename string, data []byte) bool {
+	info, err := os.Stat(filename)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+
+	room := info.Size()
+	if allocated := allocatedSize(info); allocated > room {
+		room = allocated
+	}
+
+	return int64(len(data)) <= room
 }
 
 // checkWritable does one save that leaves the content of the session file
@@ -358,9 +380,36 @@ func isTempFileName(name string, sessionName string) bool {
 	return true
 }
 
-// removeStaleTempFiles deletes temporary files that an earlier run left
-// behind when it was ended in the middle of a save. They hold tokens.
-func removeStaleTempFiles(filename string) {
+// readSessionFile reads a file that holds exactly one session of the
+// current revision. It returns nil for every other file.
+func readSessionFile(filename string) *Session {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil
+	}
+
+	session := &Session{}
+	if err := json.Unmarshal(data, session); err != nil || session.Revision != Revision {
+		return nil
+	}
+
+	return session
+}
+
+// recoverTempFiles deals with the temporary files that an earlier run
+// left behind when it was ended in the middle of a save.
+//
+// A save writes the complete session to a temporary file and then renames
+// that file over the session file. A run that was ended between the two
+// leaves the newest session in the temporary file, possibly with a
+// refresh token that the server has already put in the place of the one
+// in the session file. Such a file is complete, and its authorization is
+// not older than that of the session file. It takes the place of the
+// session file now.
+//
+// Every other leftover is removed, because it holds tokens: a file that
+// is cut off, and a file with an older authorization.
+func recoverTempFiles(filename string) {
 	target := filename
 	if resolved, err := filepath.EvalSymlinks(filename); err == nil {
 		target = resolved
@@ -373,16 +422,55 @@ func removeStaleTempFiles(filename string) {
 		return
 	}
 
+	current := readSessionFile(target)
+
+	newest := ""
+	var newestSession *Session
+
 	for _, entry := range entries {
 		if !entry.Type().IsRegular() || !isTempFileName(entry.Name(), filepath.Base(target)) {
 			continue
 		}
 
 		name := filepath.Join(dir, entry.Name())
-		if err := os.Remove(name); err == nil {
-			log.Debug().Str("filename", name).Msg("Removed a temporary session file of an earlier run")
+		leftover := readSessionFile(name)
+
+		usable := leftover != nil &&
+			(current == nil || !leftover.AuthTime.Before(current.AuthTime)) &&
+			(newestSession == nil || leftover.AuthTime.After(newestSession.AuthTime))
+
+		discard := name
+		if usable {
+			discard = newest
+			newest, newestSession = name, leftover
+		}
+
+		if discard != "" && os.Remove(discard) == nil {
+			log.Debug().Str("filename", discard).Msg("Removed a temporary session file of an earlier run")
 		}
 	}
+
+	if newest == "" {
+		return
+	}
+
+	// The file has the mode and the owner of the session file already:
+	// the save had set them before it wrote the content. Only the rename
+	// was missing.
+	err = os.Rename(newest, target)
+	if err != nil {
+		if data, readErr := os.ReadFile(newest); readErr == nil {
+			err = writeFileInPlace(target, data)
+		}
+		os.Remove(newest)
+	}
+
+	if err != nil {
+		log.Error().Str("filename", target).Err(err).Msg("Unable to recover the app session of a save that an earlier run could not finish")
+		return
+	}
+
+	log.Warn().Str("filename", target).Msg("Recovered the app session of a save that an earlier run could not finish")
 }
 
 // InitSessionStore - Initializes new application session store
@@ -398,7 +486,7 @@ func InitSessionStore(sessionFile string) *Store {
 		}
 
 		sessionStore.Filename = absFileName
-		removeStaleTempFiles(absFileName)
+		recoverTempFiles(absFileName)
 		sessionStore.Load()
 
 		// The server replaces the refresh token during the run, and the

@@ -39,6 +39,7 @@ type fakeAPI struct {
 	loginStatus int
 	loginBody   string
 	loginCalls  int32
+	loginDrop   bool // receive the login, then close the connection without an answer
 
 	// babiesStatuses - status of each request for the baby list, in
 	// order. The last entry repeats.
@@ -101,6 +102,14 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	})
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&api.loginCalls, 1)
+
+		if api.loginDrop {
+			if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+				conn.Close()
+			}
+			return
+		}
+
 		w.WriteHeader(api.loginStatus)
 		w.Write([]byte(api.loginBody))
 	})
@@ -141,6 +150,11 @@ func newTestClient(t *testing.T, api *fakeAPI) *NanitClient {
 	return &NanitClient{SessionStore: store, BaseURL: api.server.URL}
 }
 
+// renew renews the session of c with the refresh token that it holds.
+func renew(c *NanitClient) error {
+	return c.renewSession(c.SessionStore.Snapshot().RefreshToken)
+}
+
 func storedSession(t *testing.T, c *NanitClient) session.Session {
 	data, err := os.ReadFile(c.SessionStore.Filename)
 	require.NoError(t, err)
@@ -155,7 +169,7 @@ func TestRenewSessionStoresTheNewTokens(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 
-	require.NoError(t, c.renewSession())
+	require.NoError(t, renew(c))
 
 	assert.Equal(t, "refresh-1", api.lastRefresh.Load(), "the request carries the current refresh token")
 	assert.Equal(t, "access-2", c.SessionStore.Snapshot().AuthToken)
@@ -181,7 +195,7 @@ func TestRenewSessionReportsTemporaryFailures(t *testing.T) {
 			c := newTestClient(t, api)
 			breakIt(api)
 
-			err := c.renewSession()
+			err := renew(c)
 
 			require.Error(t, err)
 			assert.True(t, IsTemporary(err), "expected a temporary error, got: %v", err)
@@ -196,7 +210,7 @@ func TestRenewSessionReportsARefusalAsPermanent(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshStatus = http.StatusBadRequest
 
-	err := c.renewSession()
+	err := renew(c)
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err))
@@ -271,7 +285,22 @@ func TestLoginTakesAnAcceptedLoginWithAnUnusableAnswerAsFinal(t *testing.T) {
 
 // A login that got no answer is not sent again either: the server may
 // have received it all the same.
-func TestLoginWithoutAnAnswerIsFinal(t *testing.T) {
+func TestLoginThatTheServerMayHaveReceivedIsFinal(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.loginDrop = true
+
+	err := c.login()
+
+	require.Error(t, err)
+	assert.False(t, IsTemporary(err), "got: %v", err)
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.loginCalls), "the server did receive the login")
+}
+
+// The one failure of a login that is tried again: no connection could be
+// made, so the server cannot have received the credentials. This is the
+// case of a start before the network is up.
+func TestLoginForWhichNoConnectionCouldBeMadeIsTemporary(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 	api.server.Close()
@@ -279,7 +308,7 @@ func TestLoginWithoutAnAnswerIsFinal(t *testing.T) {
 	err := c.login()
 
 	require.Error(t, err)
-	assert.False(t, IsTemporary(err), "got: %v", err)
+	assert.True(t, IsTemporary(err), "got: %v", err)
 }
 
 // The answer to a login normally carries a new refresh token. If it does
@@ -328,6 +357,52 @@ func TestAuthorizeUsesTheConfiguredRefreshToken(t *testing.T) {
 	assert.Equal(t, "configured", api.lastRefresh.Load())
 	assert.Equal(t, "refresh-2", c.SessionStore.Snapshot().RefreshToken)
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
+}
+
+// The configured refresh token reaches the session only when the server
+// has accepted it. If the answer carries no new one, it stays the valid
+// one.
+func TestAcceptedRefreshTokenIsKeptWhenTheAnswerCarriesNoNewOne(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = "" })
+	c.RefreshToken = "configured"
+	api.refreshBody = `{"access_token":"access-2"}`
+
+	require.NoError(t, c.authorize())
+
+	assert.Equal(t, "configured", c.SessionStore.Snapshot().RefreshToken)
+	assert.Equal(t, "configured", storedSession(t, c).RefreshToken)
+}
+
+// A refresh token that the server did not accept is not stored.
+func TestRefusedConfiguredRefreshTokenIsNotStored(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = "" })
+	c.RefreshToken = "configured"
+	api.refreshStatus = http.StatusBadGateway
+
+	require.Error(t, c.authorize())
+
+	assert.Equal(t, "", c.SessionStore.Snapshot().RefreshToken)
+	assert.Equal(t, "", storedSession(t, c).RefreshToken)
+}
+
+// A request that was refused leads to a renewal of the token that it
+// carried. If the session holds another token by now, another caller has
+// replaced that token already.
+func TestRenewRefusedRenewsOnlyTheTokenThatWasRefused(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+
+	require.NoError(t, c.renewRefused("an-older-token"))
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.refreshCalls), "the session has moved on from the refused token")
+	assert.Equal(t, "access-1", c.AuthToken())
+
+	require.NoError(t, c.renewRefused("access-1"))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls))
+	assert.Equal(t, "access-2", c.AuthToken())
 }
 
 // All cameras share one session, and the server accepts a refresh token
@@ -432,7 +507,7 @@ func TestAuthResponseOfAnUnexpectedFormIsPermanent(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshBody = `{"access_token":{"value":"access-2"}}`
 
-	err := c.renewSession()
+	err := renew(c)
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err), "got: %v", err)
@@ -446,7 +521,7 @@ func TestAuthResponseOfAnUnexpectedFormKeepsItsRefreshToken(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshBody = `{"access_token":{"value":"access-2"},"refresh_token":"refresh-2"}`
 
-	err := c.renewSession()
+	err := renew(c)
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err), "got: %v", err)
@@ -464,7 +539,7 @@ func TestAuthResponseWithoutAccessToken(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshBody = `{"refresh_token":"refresh-2"}`
 
-	err := c.renewSession()
+	err := renew(c)
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err))

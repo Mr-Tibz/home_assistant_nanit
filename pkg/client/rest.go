@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"sync"
@@ -211,6 +212,26 @@ func (c *NanitClient) authorizeAfter(seen uint64) error {
 		return c.lastAuthErr
 	}
 
+	return c.runAuthorize()
+}
+
+// renewRefused gets a new token in the place of refused, which the server
+// did not accept. If the session holds another token by now, another
+// caller has replaced the refused one already, and nothing is done.
+func (c *NanitClient) renewRefused(refused string) error {
+	c.authMutex.Lock()
+	defer c.authMutex.Unlock()
+
+	if current := c.AuthToken(); current != "" && current != refused {
+		return nil
+	}
+
+	return c.runAuthorize()
+}
+
+// runAuthorize performs an authorization and records its result for the
+// callers that wait for their turn. The caller holds authMutex.
+func (c *NanitClient) runAuthorize() error {
 	c.lastAuthErr = c.authorize()
 	c.authRuns.Add(1)
 
@@ -222,46 +243,30 @@ func (c *NanitClient) authorizeAfter(seen uint64) error {
 // server says that it is no longer valid. The caller holds authMutex.
 func (c *NanitClient) authorize() error {
 	// A session without a refresh token starts with the configured one
-	if c.RefreshToken != "" && c.SessionStore.Snapshot().RefreshToken == "" {
-		c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = c.RefreshToken })
+	refreshToken := c.SessionStore.Snapshot().RefreshToken
+	if refreshToken == "" {
+		refreshToken = c.RefreshToken
 	}
 
-	refused := ""
-
-	if refreshToken := c.SessionStore.Snapshot().RefreshToken; refreshToken != "" {
-		err := c.renewSession() // We have a refresh token, so we'll use that to extend our session
+	if refreshToken != "" {
+		err := c.renewSession(refreshToken) // We have a refresh token, so we'll use that to extend our session
 		if err == nil {
 			return nil
 		}
 		if !errors.Is(err, ErrExpiredRefreshToken) {
 			return err
 		}
-
-		refused = refreshToken
 	}
 
-	// We don't have a refresh token, e.g. initial login so we need to supply username/password
-	if err := c.login(); err != nil {
-		return err
-	}
-
-	// The answer to a login normally carries a new refresh token. If it
-	// did not, the session still holds the one that the server has just
-	// refused. Drop it, as before, so that the next authorization does
-	// not send it again.
-	if refused != "" && c.SessionStore.Snapshot().RefreshToken == refused {
-		c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = "" })
-	}
-
-	return nil
+	return c.login() // We don't have a refresh token, e.g. initial login so we need to supply username/password
 }
 
 // Renews an existing session using a valid refresh token
 // If the refresh token has also expired, we need to perform a full re-login
 // The caller holds authMutex.
-func (c *NanitClient) renewSession() error {
+func (c *NanitClient) renewSession(refreshToken string) error {
 	requestBody, requestBodyErr := json.Marshal(map[string]string{
-		"refresh_token": c.SessionStore.Snapshot().RefreshToken,
+		"refresh_token": refreshToken,
 	})
 
 	if requestBodyErr != nil {
@@ -281,16 +286,26 @@ func (c *NanitClient) renewSession() error {
 		return statusError("unable to renew session", r.StatusCode)
 	}
 
-	return c.storeAuthResponse(r)
+	// If the answer carries no new refresh token, the one that the
+	// server has just accepted stays the valid one.
+	return c.storeAuthResponse(r, refreshToken)
+}
+
+// neverSent reports whether err says that no connection to the server
+// could be made, so that the request cannot have reached it.
+func neverSent(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 // login gets an auth token with the e-mail address and password. The
 // caller holds authMutex.
 //
-// No failure of a login is temporary. This program does not send the
-// e-mail address and the password a second time by itself: a server that
+// This program does not send the e-mail address and the password a second
+// time by itself after the server may have received them: a server that
 // limits logins could answer that by locking the account. Every failure
-// ends the program, as it did before.
+// of a login therefore ends the program, as it did before. The one
+// exception is a login for which no connection could be made.
 func (c *NanitClient) login() error {
 	log.Info().Str("email", c.Email).Str("password", utils.AnonymizeToken(c.Password, 0)).Msg("Authorizing using user credentials")
 	requestBody, requestBodyErr := json.Marshal(map[string]string{
@@ -311,6 +326,10 @@ func (c *NanitClient) login() error {
 	req.Header.Add("nanit-api-version", "1") // required if you have MFA enabled or it'll reject the request
 	r, clientErr := myClient.Do(req)
 	if clientErr != nil {
+		if neverSent(clientErr) {
+			return temporary("unable to fetch auth token: %w", clientErr)
+		}
+
 		// No answer has arrived, but the server may have received the
 		// request all the same.
 		return fmt.Errorf("unable to fetch auth token: %v", clientErr)
@@ -324,7 +343,9 @@ func (c *NanitClient) login() error {
 		return fmt.Errorf("unable to fetch auth token: server responded with status code %v", r.StatusCode)
 	}
 
-	if err := c.storeAuthResponse(r); err != nil {
+	// If the answer carries no new refresh token, the session keeps none:
+	// the one it had, if any, is the one that the server has just refused.
+	if err := c.storeAuthResponse(r, ""); err != nil {
 		// %v and not %w: the error must not count as temporary
 		return fmt.Errorf("unable to use the answer to the login: %v", err)
 	}
@@ -368,8 +389,10 @@ func decodeBody(r *http.Response, data interface{}) error {
 }
 
 // storeAuthResponse reads the tokens of a successful answer and saves
-// them in the session. The caller holds authMutex.
-func (c *NanitClient) storeAuthResponse(r *http.Response) error {
+// them in the session, with one save. If the answer is complete and
+// carries no refresh token, the session gets fallbackRefreshToken. The
+// caller holds authMutex.
+func (c *NanitClient) storeAuthResponse(r *http.Response, fallbackRefreshToken string) error {
 	authResponse := new(authResponsePayload)
 
 	decodeErr := decodeBody(r, authResponse)
@@ -383,13 +406,15 @@ func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 		log.Info().Str("refresh_token", utils.AnonymizeToken(authResponse.RefreshToken, 4)).Msg("Retreived")
 	}
 
-	// The server may retire the old refresh token as soon as it has sent
-	// a new one. Keep the new one whatever else the answer holds, also
-	// when another part of the answer could not be used.
 	if authResponse.RefreshToken != "" || authResponse.AccessToken != "" {
 		c.SessionStore.Update(func(s *session.Session) {
+			// The server may retire the old refresh token as soon as it
+			// has sent a new one. Keep the new one whatever else the
+			// answer holds, also when another part of it cannot be used.
 			if authResponse.RefreshToken != "" {
 				s.RefreshToken = authResponse.RefreshToken
+			} else {
+				s.RefreshToken = fallbackRefreshToken
 			}
 
 			if authResponse.AccessToken != "" {
@@ -424,10 +449,6 @@ func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 // another try from one that is not.
 func (c *NanitClient) FetchAuthorized(req *http.Request, data interface{}) error {
 	for try := 1; try <= 2; try++ {
-		// Read the count before the token. If another caller gets a new
-		// token between the two, this request already carries it, and a
-		// refusal must not lead to one more renewal.
-		seen := c.authRuns.Load()
 		token := c.AuthToken()
 
 		if token != "" {
@@ -449,7 +470,7 @@ func (c *NanitClient) FetchAuthorized(req *http.Request, data interface{}) error
 			log.Info().Msg("Token might be expired. Will try to re-authenticate.")
 		}
 
-		if err := c.authorizeAfter(seen); err != nil {
+		if err := c.renewRefused(token); err != nil {
 			return err
 		}
 	}
