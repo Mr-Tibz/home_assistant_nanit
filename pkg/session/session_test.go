@@ -46,14 +46,14 @@ func fileNames(t *testing.T, dir string) []string {
 
 func TestSaveAndLoad(t *testing.T) {
 	store := newTestStore(t)
-	store.Session.AuthToken = "access"
-	store.Session.RefreshToken = "refresh"
-	require.NoError(t, store.Save())
+	store.session.AuthToken = "access"
+	store.session.RefreshToken = "refresh"
+	require.NoError(t, store.save())
 
 	loaded := InitSessionStore(store.Filename)
 
-	assert.Equal(t, "access", loaded.Session.AuthToken)
-	assert.Equal(t, "refresh", loaded.Session.RefreshToken)
+	assert.Equal(t, "access", loaded.session.AuthToken)
+	assert.Equal(t, "refresh", loaded.session.RefreshToken)
 }
 
 // A shorter session must replace a longer one completely. The file used to
@@ -61,19 +61,19 @@ func TestSaveAndLoad(t *testing.T) {
 // the older content behind.
 func TestSaveReplacesALongerFile(t *testing.T) {
 	store := newTestStore(t)
-	store.Session.AuthToken = "a-very-long-access-token-that-makes-the-file-longer"
-	require.NoError(t, store.Save())
+	store.session.AuthToken = "a-very-long-access-token-that-makes-the-file-longer"
+	require.NoError(t, store.save())
 
-	store.Session.AuthToken = "short"
-	require.NoError(t, store.Save())
+	store.session.AuthToken = "short"
+	require.NoError(t, store.save())
 
 	assert.Equal(t, "short", readSession(t, store.Filename).AuthToken)
 }
 
 func TestSaveCreatesAPrivateFileAndLeavesNoTemporaryFile(t *testing.T) {
 	store := newTestStore(t)
-	store.Session.RefreshToken = "refresh"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "refresh"
+	require.NoError(t, store.save())
 
 	info, err := os.Stat(store.Filename)
 	require.NoError(t, err)
@@ -88,8 +88,8 @@ func TestSaveKeepsTheModeOfAnExistingFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(store.Filename, []byte(`{"revision":3}`), 0640))
 	require.NoError(t, os.Chmod(store.Filename, 0640))
 
-	store.Session.RefreshToken = "refresh"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "refresh"
+	require.NoError(t, store.save())
 
 	info, err := os.Stat(store.Filename)
 	require.NoError(t, err)
@@ -107,8 +107,8 @@ func TestSaveFollowsASymbolicLink(t *testing.T) {
 	store := newTestStore(t)
 	require.NoError(t, os.Symlink(realFile, store.Filename))
 
-	store.Session.RefreshToken = "refresh"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "refresh"
+	require.NoError(t, store.save())
 
 	info, err := os.Lstat(store.Filename)
 	require.NoError(t, err)
@@ -128,8 +128,8 @@ func TestSaveCreatesTheFileBehindADanglingLink(t *testing.T) {
 	store := newTestStore(t)
 	require.NoError(t, os.Symlink(realFile, store.Filename))
 
-	store.Session.RefreshToken = "refresh"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "refresh"
+	require.NoError(t, store.save())
 
 	info, err := os.Lstat(store.Filename)
 	require.NoError(t, err)
@@ -138,8 +138,8 @@ func TestSaveCreatesTheFileBehindADanglingLink(t *testing.T) {
 	assert.False(t, store.inPlace, "the next save can replace the file in one step")
 
 	// Now that the file exists, it is replaced like any other
-	store.Session.RefreshToken = "refresh-2"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "refresh-2"
+	require.NoError(t, store.save())
 	assert.Equal(t, "refresh-2", readSession(t, realFile).RefreshToken)
 	assert.Equal(t, []string{"real-session.json"}, fileNames(t, realDir))
 }
@@ -149,8 +149,8 @@ func TestSaveCreatesTheFileBehindADanglingLink(t *testing.T) {
 // files with a similar name that somebody made by hand.
 func TestInitRemovesStaleTemporaryFiles(t *testing.T) {
 	store := newTestStore(t)
-	store.Session.RefreshToken = "refresh"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "refresh"
+	require.NoError(t, store.save())
 
 	dir := filepath.Dir(store.Filename)
 
@@ -167,7 +167,7 @@ func TestInitRemovesStaleTemporaryFiles(t *testing.T) {
 
 	loaded := InitSessionStore(store.Filename)
 
-	assert.Equal(t, "refresh", loaded.Session.RefreshToken)
+	assert.Equal(t, "refresh", loaded.session.RefreshToken)
 	assert.ElementsMatch(t, append(keep, "session.json", "session.json.tmp-456"), fileNames(t, dir))
 }
 
@@ -222,8 +222,8 @@ func TestAPlaceThatCannotBeWrittenIsReported(t *testing.T) {
 
 	assert.Error(t, store.checkWritable())
 
-	store.Session.RefreshToken = "refresh"
-	err := store.Save()
+	store.session.RefreshToken = "refresh"
+	err := store.save()
 	assert.True(t, errors.Is(err, fs.ErrPermission), "got: %v", err)
 }
 
@@ -253,8 +253,8 @@ func TestWhichFailuresLeadToTheRewriteInPlace(t *testing.T) {
 // the next save tries the temporary file again.
 func TestAFailureThatCanPassDoesNotLeadToTheRewriteInPlace(t *testing.T) {
 	store := newTestStore(t)
-	store.Session.RefreshToken = "first"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "first"
+	require.NoError(t, store.save())
 
 	// The directory of the session file is gone: no temporary file can
 	// be created there (ENOENT)
@@ -262,13 +262,13 @@ func TestAFailureThatCanPassDoesNotLeadToTheRewriteInPlace(t *testing.T) {
 	moved := dir + "-moved"
 	require.NoError(t, os.Rename(dir, moved))
 
-	store.Session.RefreshToken = "second"
-	assert.Error(t, store.Save())
+	store.session.RefreshToken = "second"
+	assert.Error(t, store.save())
 	assert.False(t, store.inPlace)
 
 	// It is back: the save works again, through a temporary file
 	require.NoError(t, os.Rename(moved, dir))
-	require.NoError(t, store.Save())
+	require.NoError(t, store.save())
 
 	assert.Equal(t, "second", readSession(t, store.Filename).RefreshToken)
 	assert.False(t, store.inPlace)
@@ -315,9 +315,10 @@ func TestChangesAtTheSameMoment(t *testing.T) {
 
 	group.Wait()
 
+	last := store.Snapshot()
 	stored := readSession(t, store.Filename)
-	assert.Equal(t, store.Session.AuthToken, stored.AuthToken, "the file holds the last change")
-	assert.Equal(t, store.Session.RefreshToken, stored.RefreshToken)
+	assert.Equal(t, last.AuthToken, stored.AuthToken, "the file holds the last change")
+	assert.Equal(t, last.RefreshToken, stored.RefreshToken)
 	assert.Equal(t, []string{"session.json"}, fileNames(t, filepath.Dir(store.Filename)))
 }
 
@@ -347,21 +348,21 @@ func TestSaveFallsBackToInPlaceWhenTheDirectoryIsReadOnly(t *testing.T) {
 	}
 
 	store := newTestStore(t)
-	store.Session.RefreshToken = "first"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "first"
+	require.NoError(t, store.save())
 
 	dir := filepath.Dir(store.Filename)
 	require.NoError(t, os.Chmod(dir, 0500))
 	t.Cleanup(func() { os.Chmod(dir, 0700) })
 
-	store.Session.RefreshToken = "second"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "second"
+	require.NoError(t, store.save())
 
 	assert.Equal(t, "second", readSession(t, store.Filename).RefreshToken)
 	assert.True(t, store.inPlace, "the following saves do not try a temporary file again")
 
-	store.Session.RefreshToken = "third"
-	require.NoError(t, store.Save())
+	store.session.RefreshToken = "third"
+	require.NoError(t, store.save())
 
 	assert.Equal(t, "third", readSession(t, store.Filename).RefreshToken)
 }

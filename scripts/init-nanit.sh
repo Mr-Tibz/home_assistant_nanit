@@ -86,7 +86,11 @@ if [ "$DEBUG" = true ] ; then
     echo "SESSION_JSON Result: $SESSION_JSON"
 fi
 
-echo "$SESSION_JSON" > /data/session.json
-
-# The file holds tokens that give full access to the account
+# The file holds tokens that give full access to the account. Only its
+# owner may read it, from the first byte on: a new file is created private,
+# and a file that exists is made private before the tokens are written.
+umask 077
+touch /data/session.json
 chmod 600 /data/session.json
+
+echo "$SESSION_JSON" > /data/session.json

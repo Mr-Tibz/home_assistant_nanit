@@ -289,8 +289,7 @@ func (c *NanitClient) login() error {
 	req.Header.Add("nanit-api-version", "1") // required if you have MFA enabled or it'll reject the request
 	r, clientErr := myClient.Do(req)
 	if clientErr != nil {
-		// The request did not get through, so the server has not judged
-		// the credentials. Sending them again later is safe.
+		// No answer has arrived. Only this case is tried again.
 		return temporary("unable to fetch auth token: %w", clientErr)
 	}
 
@@ -307,29 +306,44 @@ func (c *NanitClient) login() error {
 		return fmt.Errorf("unable to fetch auth token: server responded with status code %v", r.StatusCode)
 	}
 
-	return c.storeAuthResponse(r)
+	if err := c.storeAuthResponse(r); err != nil {
+		// Final for the same reason, also when the answer was only cut
+		// off: the server has accepted the credentials. The error is
+		// formatted with %v so that it no longer counts as temporary.
+		return fmt.Errorf("unable to use the answer to the login: %v", err)
+	}
+
+	return nil
 }
 
+// maxResponseSize - no answer of the API comes near this size. More than
+// this is not read, so that something that answers in the place of the
+// server cannot fill the memory.
+const maxResponseSize = 4 << 20
+
 // decodeBody reads the JSON body of an answer whose status said success.
+// As before, the first JSON value of the body counts, and what follows it
+// is ignored.
 //
-// A body that does not arrive in full, or that is not JSON at all, is a
-// fault of the transfer or of something that answered in the place of
-// the server, and can pass. JSON of another form than this program
-// expects means that the API has changed: asking again does not help.
+// A body that does not arrive in full, or that is not JSON, is a fault of
+// the transfer or of something that answered in the place of the server,
+// and can pass. A body without content, or JSON of another form than this
+// program expects, means that the API has changed: asking again does not
+// help.
 func decodeBody(r *http.Response, data interface{}) error {
-	body, readErr := io.ReadAll(r.Body)
+	body, readErr := io.ReadAll(io.LimitReader(r.Body, maxResponseSize))
 	if readErr != nil {
 		return temporary("unable to read the response: %w", readErr)
 	}
 
-	jsonErr := json.Unmarshal(body, data)
+	jsonErr := json.NewDecoder(bytes.NewReader(body)).Decode(data)
 	if jsonErr == nil {
 		return nil
 	}
 
 	var syntaxErr *json.SyntaxError
-	if errors.As(jsonErr, &syntaxErr) {
-		return temporary("the response is not JSON: %w", jsonErr)
+	if errors.As(jsonErr, &syntaxErr) || errors.Is(jsonErr, io.ErrUnexpectedEOF) {
+		return temporary("the response is cut off or is not JSON: %w", jsonErr)
 	}
 
 	return fmt.Errorf("the response has an unexpected form: %w", jsonErr)

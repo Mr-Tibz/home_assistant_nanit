@@ -32,15 +32,18 @@ type Session struct {
 // Store - application session store context
 //
 // Several goroutines use the session during the run: every camera renews
-// the token, and the message poll records what it has seen. Read the
-// session with Snapshot and change it with Update. Using the fields of
-// Session directly is safe only before those goroutines start.
+// the token, and the message poll records what it has seen. Snapshot
+// reads the session, and Update changes it and stores it in the file.
 type Store struct {
 	Filename string
-	Session  *Session
 
-	// mu guards the fields of Session and the session file
-	mu sync.Mutex
+	// mu guards session. It is held only for a moment, never during a
+	// write to the disk, so reading the session does not wait for a save.
+	mu      sync.Mutex
+	session *Session
+
+	// fileMu lets one save run at a time, and guards inPlace
+	fileMu sync.Mutex
 
 	// inPlace - the session file cannot be replaced by a rename here, so
 	// every save rewrites it in place
@@ -50,7 +53,7 @@ type Store struct {
 // NewSessionStore - constructor
 func NewSessionStore() *Store {
 	return &Store{
-		Session: &Session{Revision: Revision},
+		session: &Session{Revision: Revision},
 	}
 }
 
@@ -75,7 +78,9 @@ func (store *Store) Load() {
 	}
 
 	if session.Revision == Revision {
-		store.Session = session
+		store.mu.Lock()
+		store.session = session
+		store.mu.Unlock()
 		log.Info().Str("filename", store.Filename).Msg("Loaded app session from the file")
 	} else {
 		log.Warn().Str("filename", store.Filename).Msg("App session file contains older revision of the state, ignoring")
@@ -88,21 +93,10 @@ func (store *Store) Snapshot() Session {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	return *store.Session
+	return *store.session
 }
 
-// Update changes the session with change and stores the result in the
-// file. It returns the error of Save.
-func (store *Store) Update(change func(session *Session)) error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-
-	change(store.Session)
-
-	return store.save()
-}
-
-// Save - stores current data in a file
+// Update changes the session with change and stores it in the file.
 //
 // The data goes to a temporary file that then replaces the session file
 // in one step. The session file is therefore always complete: a crash or
@@ -112,22 +106,30 @@ func (store *Store) Update(change func(session *Session)) error {
 // A failed save is logged here and returned. It does not end the program:
 // the session is still valid in memory, and ending the program would only
 // lose the tokens that have just been received.
-func (store *Store) Save() error {
+func (store *Store) Update(change func(session *Session)) error {
 	store.mu.Lock()
-	defer store.mu.Unlock()
+	change(store.session)
+	store.mu.Unlock()
 
 	return store.save()
 }
 
-// save does the work of Save. The caller holds store.mu.
+// save stores the session in the file.
+//
+// One save runs at a time, and each save writes the session as it is when
+// its turn comes. The file therefore never goes back to an older state,
+// whatever the order in which the saves get their turn.
 func (store *Store) save() error {
 	if store.Filename == "" {
 		return nil
 	}
 
+	store.fileMu.Lock()
+	defer store.fileMu.Unlock()
+
 	log.Trace().Str("filename", store.Filename).Msg("Storing app session to the file")
 
-	data, jsonErr := json.Marshal(store.Session)
+	data, jsonErr := store.marshal()
 	if jsonErr != nil {
 		log.Fatal().Str("filename", store.Filename).Err(jsonErr).Msg("Unable to marshal contents of app session file")
 	}
@@ -140,7 +142,14 @@ func (store *Store) save() error {
 	return nil
 }
 
-// write puts data in the session file. The caller holds store.mu.
+func (store *Store) marshal() ([]byte, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	return json.Marshal(store.session)
+}
+
+// write puts data in the session file. The caller holds store.fileMu.
 func (store *Store) write(data []byte) error {
 	if !store.inPlace {
 		err := replaceFile(store.Filename, data)
@@ -163,13 +172,13 @@ func (store *Store) write(data []byte) error {
 // checkWritable does one save that leaves the content of the session file
 // as it is, to find out whether saving works at all.
 func (store *Store) checkWritable() error {
-	store.mu.Lock()
-	defer store.mu.Unlock()
+	store.fileMu.Lock()
+	defer store.fileMu.Unlock()
 
 	data, err := os.ReadFile(store.Filename)
 	if errors.Is(err, os.ErrNotExist) {
 		// No file yet: create it, with the session as it is now
-		data, err = json.Marshal(store.Session)
+		data, err = store.marshal()
 	}
 	if err != nil {
 		return err

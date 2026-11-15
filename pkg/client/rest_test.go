@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -130,9 +131,12 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 func newTestClient(t *testing.T, api *fakeAPI) *NanitClient {
 	store := session.NewSessionStore()
 	store.Filename = filepath.Join(t.TempDir(), "session.json")
-	store.Session.AuthToken = "access-1"
-	store.Session.RefreshToken = "refresh-1"
-	store.Session.AuthTime = time.Now().Add(-2 * AuthTokenTimelife)
+
+	require.NoError(t, store.Update(func(s *session.Session) {
+		s.AuthToken = "access-1"
+		s.RefreshToken = "refresh-1"
+		s.AuthTime = time.Now().Add(-2 * AuthTokenTimelife)
+	}))
 
 	return &NanitClient{SessionStore: store, BaseURL: api.server.URL}
 }
@@ -154,9 +158,9 @@ func TestRenewSessionStoresTheNewTokens(t *testing.T) {
 	require.NoError(t, c.renewSession())
 
 	assert.Equal(t, "refresh-1", api.lastRefresh.Load(), "the request carries the current refresh token")
-	assert.Equal(t, "access-2", c.SessionStore.Session.AuthToken)
-	assert.Equal(t, "refresh-2", c.SessionStore.Session.RefreshToken)
-	assert.WithinDuration(t, time.Now(), c.SessionStore.Session.AuthTime, time.Minute)
+	assert.Equal(t, "access-2", c.SessionStore.Snapshot().AuthToken)
+	assert.Equal(t, "refresh-2", c.SessionStore.Snapshot().RefreshToken)
+	assert.WithinDuration(t, time.Now(), c.SessionStore.Snapshot().AuthTime, time.Minute)
 
 	stored := storedSession(t, c)
 	assert.Equal(t, "access-2", stored.AuthToken)
@@ -181,8 +185,8 @@ func TestRenewSessionReportsTemporaryFailures(t *testing.T) {
 
 			require.Error(t, err)
 			assert.True(t, IsTemporary(err), "expected a temporary error, got: %v", err)
-			assert.Equal(t, "access-1", c.SessionStore.Session.AuthToken, "the session keeps its tokens")
-			assert.Equal(t, "refresh-1", c.SessionStore.Session.RefreshToken, "the session keeps its tokens")
+			assert.Equal(t, "access-1", c.SessionStore.Snapshot().AuthToken, "the session keeps its tokens")
+			assert.Equal(t, "refresh-1", c.SessionStore.Snapshot().RefreshToken, "the session keeps its tokens")
 		})
 	}
 }
@@ -207,8 +211,8 @@ func TestAuthorizeLogsInWhenTheRefreshTokenHasExpired(t *testing.T) {
 	require.NoError(t, c.authorize())
 
 	assert.EqualValues(t, 1, atomic.LoadInt32(&api.loginCalls))
-	assert.Equal(t, "access-login", c.SessionStore.Session.AuthToken)
-	assert.Equal(t, "refresh-login", c.SessionStore.Session.RefreshToken)
+	assert.Equal(t, "access-login", c.SessionStore.Snapshot().AuthToken)
+	assert.Equal(t, "refresh-login", c.SessionStore.Snapshot().RefreshToken)
 }
 
 // A temporary failure of the renewal must not fall through to a login
@@ -243,6 +247,28 @@ func TestLoginTakesEveryAnswerOfTheServerAsFinal(t *testing.T) {
 	}
 }
 
+// The same holds when the server accepts the login and its answer cannot
+// be used, for example because it was cut off.
+func TestLoginTakesAnAcceptedLoginWithAnUnusableAnswerAsFinal(t *testing.T) {
+	for name, body := range map[string]string{
+		"cut off":    `{"access_token":`,
+		"not JSON":   `<html>`,
+		"no content": ``,
+		"no token":   `{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI(t)
+			c := newTestClient(t, api)
+			api.loginBody = body
+
+			err := c.login()
+
+			require.Error(t, err)
+			assert.False(t, IsTemporary(err), "got: %v", err)
+		})
+	}
+}
+
 // A login that did not reach the server can be sent again.
 func TestLoginThatDidNotGetThroughIsTemporary(t *testing.T) {
 	api := newFakeAPI(t)
@@ -258,7 +284,7 @@ func TestLoginThatDidNotGetThroughIsTemporary(t *testing.T) {
 func TestMaybeAuthorizeKeepsAFreshToken(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
-	c.SessionStore.Session.AuthTime = time.Now()
+	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now() })
 
 	require.NoError(t, c.MaybeAuthorize(false))
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.refreshCalls), "a fresh token needs no request")
@@ -272,13 +298,13 @@ func TestMaybeAuthorizeKeepsAFreshToken(t *testing.T) {
 func TestAuthorizeUsesTheConfiguredRefreshToken(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
-	c.SessionStore.Session.RefreshToken = ""
+	c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = "" })
 	c.RefreshToken = "configured"
 
 	require.NoError(t, c.authorize())
 
 	assert.Equal(t, "configured", api.lastRefresh.Load())
-	assert.Equal(t, "refresh-2", c.SessionStore.Session.RefreshToken)
+	assert.Equal(t, "refresh-2", c.SessionStore.Snapshot().RefreshToken)
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
 }
 
@@ -368,7 +394,7 @@ func TestACallerThatWaitedSharesTheFailure(t *testing.T) {
 func TestAFreshTokenIsEnoughWithoutForce(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
-	c.SessionStore.Session.AuthTime = time.Now()
+	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now() })
 	api.refreshStatus = http.StatusBadGateway
 
 	require.Error(t, c.MaybeAuthorize(true))
@@ -388,7 +414,7 @@ func TestAuthResponseOfAnUnexpectedFormIsPermanent(t *testing.T) {
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err), "got: %v", err)
-	assert.Equal(t, "access-1", c.SessionStore.Session.AuthToken, "the session keeps its tokens")
+	assert.Equal(t, "access-1", c.SessionStore.Snapshot().AuthToken, "the session keeps its tokens")
 }
 
 // An answer that reports success but carries no access token is not
@@ -404,9 +430,35 @@ func TestAuthResponseWithoutAccessToken(t *testing.T) {
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err))
-	assert.Equal(t, "access-1", c.SessionStore.Session.AuthToken, "the old access token stays")
-	assert.Equal(t, "refresh-2", c.SessionStore.Session.RefreshToken, "the new refresh token is kept")
+	assert.Equal(t, "access-1", c.SessionStore.Snapshot().AuthToken, "the old access token stays")
+	assert.Equal(t, "refresh-2", c.SessionStore.Snapshot().RefreshToken, "the new refresh token is kept")
 	assert.Equal(t, "refresh-2", storedSession(t, c).RefreshToken, "the new refresh token is saved")
+}
+
+// As before this change, the first JSON value of an answer counts, and
+// what follows it is ignored.
+func TestFetchAuthorizedIgnoresWhatFollowsTheAnswer(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.babiesBody += "\n{\"more\":true} and more"
+
+	babies, err := c.FetchBabies()
+
+	require.NoError(t, err)
+	assert.Len(t, babies, 1)
+}
+
+// An answer that is far longer than any answer of the API is not read to
+// its end.
+func TestFetchAuthorizedDoesNotReadAnEndlessAnswer(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.babiesBody = `{"babies":[{"uid":"` + strings.Repeat("x", maxResponseSize) + `"}]}`
+
+	_, err := c.FetchBabies()
+
+	require.Error(t, err)
+	assert.True(t, IsTemporary(err), "the answer counts as cut off, got: %.200v", err)
 }
 
 func TestFetchBabies(t *testing.T) {
@@ -458,7 +510,7 @@ func TestFetchAuthorizedSortsAnswersItCannotUse(t *testing.T) {
 	}{
 		"not JSON, something else answered": {`<html>Sign in to the network</html>`, true},
 		"cut off":                           {`{"babies":[{"uid":"baby-1"`, true},
-		"empty":                             {``, true},
+		"no content":                        {``, false},
 		"JSON of another form":              {`{"babies":"none"}`, false},
 	} {
 		t.Run(name, func(t *testing.T) {
