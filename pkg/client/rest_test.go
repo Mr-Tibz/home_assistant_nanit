@@ -147,7 +147,7 @@ func newTestClient(t *testing.T, api *fakeAPI) *NanitClient {
 		s.AuthTime = time.Now().Add(-2 * AuthTokenTimelife)
 	}))
 
-	return &NanitClient{SessionStore: store, BaseURL: api.server.URL}
+	return &NanitClient{Email: "parent@example.com", Password: "password", SessionStore: store, BaseURL: api.server.URL}
 }
 
 // renew renews the session of c with the refresh token that it holds.
@@ -309,6 +309,58 @@ func TestLoginForWhichNoConnectionCouldBeMadeIsTemporary(t *testing.T) {
 
 	require.Error(t, err)
 	assert.True(t, IsTemporary(err), "got: %v", err)
+}
+
+// Most setups have only a refresh token, because the account needs a
+// second factor for a login. When that token is no longer valid, the
+// error says so. A login without e-mail address and password is not sent:
+// its refusal would name the wrong cause.
+func TestAuthorizeWithoutCredentialsDoesNotLogIn(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	c.Email, c.Password = "", ""
+	api.refreshStatus = http.StatusNotFound
+
+	err := c.authorize()
+
+	require.Error(t, err)
+	assert.False(t, IsTemporary(err))
+	assert.Contains(t, err.Error(), "refresh token is no longer valid")
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
+}
+
+// The renewal before a new attempt to connect is a precaution. If the
+// server answers it with an error of its own, the caller goes on with the
+// token of the session, as long as that token should still be valid.
+func TestAuthorizeForAttempt(t *testing.T) {
+	for name, tc := range map[string]struct {
+		renew     bool
+		fresh     bool
+		breakIt   func(api *fakeAPI)
+		wantError bool
+	}{
+		"server error, fresh token":      {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, false},
+		"too many requests, fresh token": {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusTooManyRequests }, false},
+		"server error, old token":        {true, false, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, true},
+		"no answer, fresh token":         {true, true, func(api *fakeAPI) { api.server.Close() }, true},
+		"refusal, fresh token":           {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusBadRequest }, true},
+		"renewal works":                  {true, true, func(api *fakeAPI) {}, false},
+		"no renewal asked, old token":    {false, false, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, true},
+		"no renewal asked, fresh token":  {false, true, func(api *fakeAPI) { api.server.Close() }, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI(t)
+			c := newTestClient(t, api)
+			if tc.fresh {
+				c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now() })
+			}
+			tc.breakIt(api)
+
+			err := c.AuthorizeForAttempt(tc.renew)
+
+			assert.Equal(t, tc.wantError, err != nil, "got: %v", err)
+		})
+	}
 }
 
 // The answer to a login normally carries a new refresh token. If it does
@@ -564,7 +616,7 @@ func TestFetchAuthorizedIgnoresWhatFollowsTheAnswer(t *testing.T) {
 }
 
 // An answer that is far longer than any answer of the API is not read to
-// its end.
+// its end, and it is not asked for again.
 func TestFetchAuthorizedDoesNotReadAnEndlessAnswer(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
@@ -573,7 +625,8 @@ func TestFetchAuthorizedDoesNotReadAnEndlessAnswer(t *testing.T) {
 	_, err := c.FetchBabies()
 
 	require.Error(t, err)
-	assert.True(t, IsTemporary(err), "the answer counts as cut off, got: %.200v", err)
+	assert.False(t, IsTemporary(err), "got: %.200v", err)
+	assert.Contains(t, err.Error(), "longer than")
 }
 
 func TestFetchBabies(t *testing.T) {

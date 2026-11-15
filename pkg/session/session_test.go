@@ -185,8 +185,8 @@ func TestInitRemovesStaleTemporaryFilesInADirectoryWithSpecialCharacters(t *test
 	assert.Equal(t, []string{"session.json"}, fileNames(t, dir), "the leftover is gone, and the start has created the session file")
 }
 
-// The start finds out whether the session file can be written, with a
-// save that leaves the content as it is.
+// The start finds out whether the session file can be written. It does
+// not touch the content of a file that exists.
 func TestCheckWritableKeepsTheContent(t *testing.T) {
 	store := newTestStore(t)
 	content := []byte(`{"revision":1,"somethingOfAnotherVersion":true}`)
@@ -197,6 +197,21 @@ func TestCheckWritableKeepsTheContent(t *testing.T) {
 	data, err := os.ReadFile(store.Filename)
 	require.NoError(t, err)
 	assert.Equal(t, content, data)
+}
+
+// A file that this process may not write is reported, as the first save
+// reported it before.
+func TestCheckWritableReportsAFileThatCannotBeWritten(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can write to a read-only file")
+	}
+
+	store := newTestStore(t)
+	require.NoError(t, os.WriteFile(store.Filename, []byte(`{"revision":3}`), 0400))
+
+	err := store.checkWritable()
+
+	assert.True(t, errors.Is(err, fs.ErrPermission), "got: %v", err)
 }
 
 func TestCheckWritableCreatesAMissingFile(t *testing.T) {

@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"net/http/httptrace"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -41,6 +41,10 @@ const defaultAPIBaseURL = "https://api.nanit.com"
 // an error in the log each time, and does not end the program.
 type TemporaryError struct {
 	Err error
+
+	// Status - HTTP status of the answer, when the failure is an answer
+	// of the server. 0 when no answer has arrived.
+	Status int
 }
 
 func (e *TemporaryError) Error() string { return e.Err.Error() }
@@ -63,7 +67,7 @@ func statusError(what string, code int) error {
 	err := fmt.Errorf("%v: server responded with status code %v", what, code)
 
 	if code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
-		return &TemporaryError{Err: err}
+		return &TemporaryError{Err: err, Status: code}
 	}
 
 	return err
@@ -192,14 +196,40 @@ func (c *NanitClient) AuthToken() string {
 func (c *NanitClient) MaybeAuthorize(force bool) error {
 	seen := c.authRuns.Load()
 
-	if !force {
-		current := c.SessionStore.Snapshot()
-		if current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife {
-			return nil
-		}
+	if !force && c.hasFreshToken() {
+		return nil
 	}
 
 	return c.authorizeAfter(seen)
+}
+
+// hasFreshToken reports whether the session holds an auth token that
+// should still be valid.
+func (c *NanitClient) hasFreshToken() bool {
+	current := c.SessionStore.Snapshot()
+
+	return current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife
+}
+
+// AuthorizeForAttempt - authorization before an attempt to connect.
+//
+// A caller sets renew when its attempt before this one failed: the token
+// may have been the cause, so a new one is asked for although the token
+// of the session should still be valid. That renewal is a precaution. If
+// the server answers it with an error of its own (5xx, 408, 429), the
+// network works and the token of the session may well be good, so the
+// caller goes on with that token. Without this, a renewal service that is
+// down would keep every camera from connecting for as long as it is down.
+func (c *NanitClient) AuthorizeForAttempt(renew bool) error {
+	err := c.MaybeAuthorize(renew)
+
+	var temporary *TemporaryError
+	if renew && errors.As(err, &temporary) && temporary.Status != 0 && c.hasFreshToken() {
+		log.Warn().Err(err).Msg("Unable to renew the auth token. Going on with the token of the session, which should still be valid")
+		return nil
+	}
+
+	return err
 }
 
 // authorizeAfter performs an authorization. If one has ended since the
@@ -250,7 +280,18 @@ func (c *NanitClient) authorize() error {
 		}
 	}
 
-	return c.login() // We don't have a refresh token, e.g. initial login so we need to supply username/password
+	// We don't have a refresh token, e.g. initial login so we need to supply username/password
+	if c.Email == "" || c.Password == "" {
+		// A login without them cannot work, and its refusal would hide
+		// the cause.
+		if refreshToken != "" {
+			return errors.New("the refresh token is no longer valid, and no e-mail address and password are configured for a login. Get a new refresh token with init-nanit.sh (see the README)")
+		}
+
+		return errors.New("there is no refresh token, and no e-mail address and password are configured for a login. Get a refresh token with init-nanit.sh (see the README)")
+	}
+
+	return c.login()
 }
 
 // Renews an existing session using a valid refresh token
@@ -283,13 +324,6 @@ func (c *NanitClient) renewSession(refreshToken string) error {
 	return c.storeAuthResponse(r, refreshToken)
 }
 
-// neverSent reports whether err says that no connection to the server
-// could be made, so that the request cannot have reached it.
-func neverSent(err error) bool {
-	var opErr *net.OpError
-	return errors.As(err, &opErr) && opErr.Op == "dial"
-}
-
 // login gets an auth token with the e-mail address and password. The
 // caller holds authMutex.
 //
@@ -316,9 +350,17 @@ func (c *NanitClient) login() error {
 	}
 	req.Header.Add("Content-Type", "application/json")
 	req.Header.Add("nanit-api-version", "1") // required if you have MFA enabled or it'll reject the request
+
+	// connected - a connection to the server was there for this request.
+	// Without one, the server cannot have received the credentials.
+	var connected atomic.Bool
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	}))
+
 	r, clientErr := myClient.Do(req)
 	if clientErr != nil {
-		if neverSent(clientErr) {
+		if !connected.Load() {
 			return temporary("unable to fetch auth token: %w", clientErr)
 		}
 
@@ -346,9 +388,9 @@ func (c *NanitClient) login() error {
 	return nil
 }
 
-// maxResponseSize - no answer of the API comes near this size. More than
-// this is not read, so that something that answers in the place of the
-// server cannot fill the memory.
+// maxResponseSize - no answer of the API comes near this size. A longer
+// answer is not read to its end, so that it cannot fill the memory, and
+// it is not tried again.
 const maxResponseSize = 4 << 20
 
 // decodeBody reads the JSON body of an answer whose status said success.
@@ -363,9 +405,12 @@ const maxResponseSize = 4 << 20
 //
 // When the form does not fit, data still holds the fields that did fit.
 func decodeBody(r *http.Response, data interface{}) error {
-	body, readErr := io.ReadAll(io.LimitReader(r.Body, maxResponseSize))
+	body, readErr := io.ReadAll(io.LimitReader(r.Body, maxResponseSize+1))
 	if readErr != nil {
 		return temporary("unable to read the response: %w", readErr)
+	}
+	if len(body) > maxResponseSize {
+		return fmt.Errorf("the response is longer than %v bytes", maxResponseSize)
 	}
 
 	jsonErr := json.NewDecoder(bytes.NewReader(body)).Decode(data)

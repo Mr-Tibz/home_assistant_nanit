@@ -111,7 +111,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// next one at once and as a first try (see ResetThreshold).
 	force := attempt.GetTry() > 1
 	err := RetryTemporary(attempt.Done(), authorizeWaits, "authorize", func() error {
-		return manager.API.MaybeAuthorize(force)
+		return manager.API.AuthorizeForAttempt(force)
 	})
 	if errors.Is(err, ErrRetryCancelled) {
 		return

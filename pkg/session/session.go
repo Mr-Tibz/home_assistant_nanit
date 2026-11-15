@@ -209,17 +209,24 @@ func fitsInPlace(filename string, data []byte) bool {
 	return int64(len(data)) <= room
 }
 
-// checkWritable does one save that leaves the content of the session file
-// as it is, to find out whether saving works at all.
+// checkWritable finds out whether the session can be saved at all. A
+// file that exists is only opened for writing, which is what the rewrite
+// in place needs. Its content is not touched: writing it back would undo
+// a change that the setup script makes at the same moment. A file that
+// does not exist yet is created, with the session as it is now.
 func (store *Store) checkWritable() error {
 	store.fileMu.Lock()
 	defer store.fileMu.Unlock()
 
-	data, err := os.ReadFile(store.Filename)
-	if errors.Is(err, os.ErrNotExist) {
-		// No file yet: create it, with the session as it is now
-		data, err = store.marshal()
+	f, err := os.OpenFile(store.Filename, os.O_WRONLY, 0)
+	if err == nil {
+		return f.Close()
 	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	data, err := store.marshal()
 	if err != nil {
 		return err
 	}
