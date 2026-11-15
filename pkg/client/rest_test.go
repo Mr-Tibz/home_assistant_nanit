@@ -389,18 +389,20 @@ func TestRefusedConfiguredRefreshTokenIsNotStored(t *testing.T) {
 	assert.Equal(t, "", storedSession(t, c).RefreshToken)
 }
 
-// A request that was refused leads to a renewal of the token that it
-// carried. If the session holds another token by now, another caller has
-// replaced that token already.
-func TestRenewRefusedRenewsOnlyTheTokenThatWasRefused(t *testing.T) {
+// A request reads the token together with the number of authorizations
+// that had ended. If another caller gets a new token before the refusal
+// of the request arrives, that token is used and no further renewal is
+// made.
+func TestFetchAuthorizedUsesATokenThatAnotherCallerGotInTheMeantime(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 
-	require.NoError(t, c.renewRefused("an-older-token"))
-	assert.EqualValues(t, 0, atomic.LoadInt32(&api.refreshCalls), "the session has moved on from the refused token")
-	assert.Equal(t, "access-1", c.AuthToken())
+	token, seen := c.tokenForRequest()
+	assert.Equal(t, "access-1", token)
 
-	require.NoError(t, c.renewRefused("access-1"))
+	require.NoError(t, c.MaybeAuthorize(true)) // another caller renews while the request is on its way
+	require.NoError(t, c.authorizeAfter(seen)) // the request comes back refused
+
 	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls))
 	assert.Equal(t, "access-2", c.AuthToken())
 }

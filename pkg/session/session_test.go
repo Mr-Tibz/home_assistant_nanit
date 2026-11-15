@@ -11,7 +11,6 @@ import (
 	"sync"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -184,119 +183,6 @@ func TestInitRemovesStaleTemporaryFilesInADirectoryWithSpecialCharacters(t *test
 	InitSessionStore(filename)
 
 	assert.Equal(t, []string{"session.json"}, fileNames(t, dir), "the leftover is gone, and the start has created the session file")
-}
-
-// leftover writes a temporary file as a save leaves it when the run ends
-// between the write and the rename.
-func leftover(t *testing.T, filename string, number string, content string) string {
-	name := filename + tempFileMark + number
-	require.NoError(t, os.WriteFile(name, []byte(content), 0600))
-	return name
-}
-
-func sessionJSON(t *testing.T, change func(s *Session)) string {
-	s := &Session{Revision: Revision}
-	change(s)
-
-	data, err := json.Marshal(s)
-	require.NoError(t, err)
-
-	return string(data)
-}
-
-// A run that was ended between the write of the temporary file and the
-// rename leaves the newest session in the temporary file, possibly with a
-// refresh token that the server has already put in the place of the old
-// one. The next start completes the save.
-func TestInitCompletesASaveThatWasCutShort(t *testing.T) {
-	saved := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	store := newTestStore(t)
-	store.session.RefreshToken = "refresh-1"
-	store.session.AuthTime = saved
-	require.NoError(t, store.save())
-
-	leftover(t, store.Filename, "123", sessionJSON(t, func(s *Session) {
-		s.AuthToken = "access-2"
-		s.RefreshToken = "refresh-2"
-		s.AuthTime = saved.Add(time.Hour)
-	}))
-
-	loaded := InitSessionStore(store.Filename)
-
-	assert.Equal(t, "refresh-2", loaded.Snapshot().RefreshToken)
-	assert.Equal(t, "refresh-2", readSession(t, store.Filename).RefreshToken)
-	assert.Equal(t, []string{"session.json"}, fileNames(t, filepath.Dir(store.Filename)))
-}
-
-// Without a session file, a complete leftover is the session.
-func TestInitUsesACompleteLeftoverWhenThereIsNoSessionFile(t *testing.T) {
-	store := newTestStore(t)
-	leftover(t, store.Filename, "123", sessionJSON(t, func(s *Session) { s.RefreshToken = "refresh-2" }))
-
-	loaded := InitSessionStore(store.Filename)
-
-	assert.Equal(t, "refresh-2", loaded.Snapshot().RefreshToken)
-	assert.Equal(t, []string{"session.json"}, fileNames(t, filepath.Dir(store.Filename)))
-}
-
-// Of several leftovers, the one with the newest authorization counts.
-func TestInitUsesTheNewestLeftover(t *testing.T) {
-	saved := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	store := newTestStore(t)
-	store.session.RefreshToken = "refresh-1"
-	store.session.AuthTime = saved
-	require.NoError(t, store.save())
-
-	for number, hours := range map[string]int{"1": 2, "2": 3, "3": 1} {
-		leftover(t, store.Filename, number, sessionJSON(t, func(s *Session) {
-			s.RefreshToken = fmt.Sprintf("refresh-after-%d-hours", hours)
-			s.AuthTime = saved.Add(time.Duration(hours) * time.Hour)
-		}))
-	}
-
-	loaded := InitSessionStore(store.Filename)
-
-	assert.Equal(t, "refresh-after-3-hours", loaded.Snapshot().RefreshToken)
-	assert.Equal(t, []string{"session.json"}, fileNames(t, filepath.Dir(store.Filename)))
-}
-
-// A leftover that cannot be the newest session is removed, and the
-// session file stays as it is.
-func TestInitRemovesALeftoverThatIsNotTheNewestSession(t *testing.T) {
-	saved := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-
-	newer := sessionJSON(t, func(s *Session) {
-		s.RefreshToken = "refresh-2"
-		s.AuthTime = saved.Add(time.Hour)
-	})
-
-	for name, content := range map[string]string{
-		"cut off": newer[:len(newer)/2],
-		"empty":   "",
-		"an older authorization": sessionJSON(t, func(s *Session) {
-			s.RefreshToken = "refresh-0"
-			s.AuthTime = saved.Add(-time.Hour)
-		}),
-		"another revision":      strings.Replace(newer, fmt.Sprintf(`"revision":%d`, Revision), `"revision":1`, 1),
-		"more than one session": newer + newer,
-	} {
-		t.Run(name, func(t *testing.T) {
-			store := newTestStore(t)
-			store.session.RefreshToken = "refresh-1"
-			store.session.AuthTime = saved
-			require.NoError(t, store.save())
-
-			leftover(t, store.Filename, "123", content)
-
-			loaded := InitSessionStore(store.Filename)
-
-			assert.Equal(t, "refresh-1", loaded.Snapshot().RefreshToken)
-			assert.Equal(t, "refresh-1", readSession(t, store.Filename).RefreshToken)
-			assert.Equal(t, []string{"session.json"}, fileNames(t, filepath.Dir(store.Filename)))
-		})
-	}
 }
 
 // The start finds out whether the session file can be written, with a

@@ -60,23 +60,30 @@ func NewApp(opts Opts) *App {
 
 // Run - application main loop
 func (app *App) Run(ctx utils.GracefulContext) {
-	// Fetch babies info if they are not present in session.
+	// Reauthorize if we don't have a token or we assume it is invalid,
+	// and fetch babies info if they are not present in session.
 	//
-	// There is no authorization step of its own here. Everything that
-	// uses the auth token gets or renews it by itself: the request for
-	// the baby list, the message poll and every websocket attempt.
+	// The authorization comes first, as before: a session that the setup
+	// script has made holds no auth token that a request could use.
 	//
 	// A failure that can pass, like no network yet after a boot, is tried
 	// again. Any other failure ends the program.
-	err := client.RetryTemporary(ctx.Done(), startupWaits, "fetch the baby list", func() error {
-		_, err := app.RestClient.EnsureBabies()
-		return err
-	})
-	if errors.Is(err, client.ErrRetryCancelled) {
-		return
-	}
-	if err != nil {
-		log.Fatal().Err(err).Msg("Unable to fetch the baby list")
+	var babies []baby.Baby
+
+	for _, step := range []struct {
+		what string
+		run  func() error
+	}{
+		{"authorize", func() error { return app.RestClient.MaybeAuthorize(false) }},
+		{"fetch the baby list", func() (err error) { babies, err = app.RestClient.EnsureBabies(); return err }},
+	} {
+		err := client.RetryTemporary(ctx.Done(), startupWaits, step.what, step.run)
+		if errors.Is(err, client.ErrRetryCancelled) {
+			return
+		}
+		if err != nil {
+			log.Fatal().Err(err).Msgf("Unable to %v", step.what)
+		}
 	}
 
 	// RTMP
@@ -90,8 +97,6 @@ func (app *App) Run(ctx utils.GracefulContext) {
 			app.MQTTConnection.Run(app.BabyStateManager, childCtx)
 		})
 	}
-
-	babies := app.SessionStore.Snapshot().Babies
 
 	// Start reading the data from the stream
 	for _, babyInfo := range babies {
