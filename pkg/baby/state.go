@@ -214,7 +214,7 @@ func (state *State) SetTemperature(value bool) *State {
 
 // GetIsWebsocketAlive - safely returns value
 func (state *State) GetIsWebsocketAlive() bool {
-	if state.StreamState != nil {
+	if state.IsWebsocketAlive != nil {
 		return *state.IsWebsocketAlive
 	}
 

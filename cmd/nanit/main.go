@@ -65,14 +65,14 @@ func main() {
 	}
 
 	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+	signal.Notify(interrupt, terminationSignals()...)
 
 	instance := app.NewApp(opts)
 
 	runner := utils.RunWithGracefulCancel(instance.Run)
 
-	<-interrupt
-	log.Warn().Msg("Received interrupt signal, terminating")
+	sig := <-interrupt
+	log.Warn().Stringer("signal", sig).Msg("Received termination signal, terminating")
 
 	waitForCleanup := make(chan struct{}, 1)
 
@@ -82,8 +82,8 @@ func main() {
 	}()
 
 	select {
-	case <-interrupt:
-		log.Fatal().Msg("Received another interrupt signal, forcing termination without clean up")
+	case sig := <-interrupt:
+		log.Fatal().Stringer("signal", sig).Msg("Received another termination signal, forcing termination without clean up")
 	case <-waitForCleanup:
 		log.Info().Msg("Clean exit")
 		return

@@ -50,3 +50,29 @@ func TestStateMergeDifferent(t *testing.T) {
 	assert.Equal(t, 20.0, s3.GetHumidity())
 	assert.Equal(t, baby.StreamState_Alive, s3.GetStreamState())
 }
+
+// The websocket flag is read from its own field. It used to be guarded by
+// the stream state: with no stream state yet it reported "not alive" for a
+// live websocket, and with a stream state but no flag it panicked.
+func TestGetIsWebsocketAlive(t *testing.T) {
+	t.Run("alive before any stream state is known", func(t *testing.T) {
+		s := baby.NewState().SetWebsocketAlive(true)
+		assert.True(t, s.GetIsWebsocketAlive())
+	})
+
+	t.Run("not alive", func(t *testing.T) {
+		s := baby.NewState().SetWebsocketAlive(false).SetStreamState(baby.StreamState_Alive)
+		assert.False(t, s.GetIsWebsocketAlive())
+	})
+
+	t.Run("unknown while a stream state is known", func(t *testing.T) {
+		s := baby.NewState().SetStreamState(baby.StreamState_Unhealthy)
+		assert.NotPanics(t, func() {
+			assert.False(t, s.GetIsWebsocketAlive())
+		})
+	})
+
+	t.Run("unknown", func(t *testing.T) {
+		assert.False(t, baby.NewState().GetIsWebsocketAlive())
+	})
+}
