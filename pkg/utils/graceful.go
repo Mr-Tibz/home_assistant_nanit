@@ -37,6 +37,7 @@ func RunWithGracefulCancel(callback func(GracefulContext)) GracefulRunner {
 
 	go func() {
 		callback(ctx)
+		ctx.handlerReturned()
 		ctx.wg.Done()
 	}()
 
@@ -53,14 +54,14 @@ func newGracefulRunner(ctx *gracefulCtx) *gracefulRunner {
 	return &gracefulRunner{ctx}
 }
 
+// Wait - blocks until the handler and its children have finished. It
+// reports how the handler ended: whether it had been cancelled, and the
+// error it had been failed with, at the moment it returned.
 func (runner *gracefulRunner) Wait() (bool, error) {
 	runner.ctx.wg.Wait()
 
-	// Fail() can still run after the handler has returned (a parent that
-	// gets cancelled cancels its children), so read the error under the
-	// same lock that Fail() writes it with.
 	runner.ctx.mutex.Lock()
-	err := runner.ctx.err
+	err := runner.ctx.result
 	runner.ctx.mutex.Unlock()
 
 	return err == errCancel, err
@@ -79,6 +80,14 @@ type gracefulCtx struct {
 	mutex           sync.Mutex
 	hasBeenCanceled bool
 	err             error
+
+	// result is the value of err at the moment the handler returned. A
+	// context can still be failed after that, because the cancellation of
+	// a parent reaches its children also when their handler has just
+	// returned. That must not turn a handler that finished into one that
+	// was cancelled, so Wait() reports this copy and not err.
+	result    error
+	resultSet bool
 }
 
 func newGracefulCtx() *gracefulCtx {
@@ -113,6 +122,12 @@ func (c *gracefulCtx) RunAsChild(callback func(GracefulContext)) GracefulRunner 
 	runner := RunWithGracefulCancel(func(childCtx GracefulContext) {
 		callback(childCtx)
 
+		// Record the child's result before the parent is told. From here
+		// on the parent may cancel this child without changing it.
+		if c, ok := childCtx.(*gracefulCtx); ok {
+			c.handlerReturned()
+		}
+
 		// Notify parent that child is done
 		c.wg.Done()
 
@@ -131,6 +146,17 @@ func (c *gracefulCtx) RunAsChild(callback func(GracefulContext)) GracefulRunner 
 	}()
 
 	return runner
+}
+
+// handlerReturned records how the handler ended. Only the first call
+// counts. See gracefulCtx.result.
+func (c *gracefulCtx) handlerReturned() {
+	c.mutex.Lock()
+	if !c.resultSet {
+		c.result = c.err
+		c.resultSet = true
+	}
+	c.mutex.Unlock()
 }
 
 func (c *gracefulCtx) Fail(err error) {

@@ -2,31 +2,12 @@ package utils_test
 
 import (
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 )
-
-// recorder collects the order of events from several goroutines.
-type recorder struct {
-	mu  sync.Mutex
-	out string
-}
-
-func (r *recorder) add(event string) {
-	r.mu.Lock()
-	r.out += event
-	r.mu.Unlock()
-}
-
-func (r *recorder) String() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.out
-}
 
 // The tests below order their events with channels, not with sleeps, so
 // that a slow machine cannot make a correct runner fail them.
@@ -97,91 +78,35 @@ func (s *scenario) mustStillBlock(ch <-chan struct{}, what string) {
 	}
 }
 
+// waitResult is what GracefulRunner.Wait() returned.
+type waitResult struct {
+	cancelled bool
+	err       error
+}
+
+// wait calls runner.Wait() on another goroutine. The returned channel
+// delivers once, when Wait() has returned.
+func wait(runner utils.GracefulRunner) (<-chan struct{}, *waitResult) {
+	res := &waitResult{}
+	done := make(chan struct{})
+
+	go func() {
+		res.cancelled, res.err = runner.Wait()
+		close(done)
+	}()
+
+	return done, res
+}
+
 // A cancelled runner waits for its handler and for the children of that
 // handler, also when a child finishes after the handler itself.
 func TestGracefulRunner(t *testing.T) {
 	s := newScenario(t)
-	out := &recorder{}
 	started := make(chan struct{})
-	mainDone := make(chan struct{})
-	releaseChild := make(chan struct{})
-
-	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
-		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			if s.await(childCtx.Done()) && s.await(releaseChild) {
-				out.add(" sub_finished")
-			}
-		})
-
-		close(started)
-		if s.await(ctx.Done()) {
-			out.add(" main_finished")
-		}
-		close(mainDone)
-	})
-
-	s.must(started, "the handler to start")
-
-	cancelled := make(chan struct{})
-	go func() {
-		runner.Cancel()
-		close(cancelled)
-	}()
-
-	s.must(mainDone, "the handler to finish")
-	s.mustStillBlock(cancelled, "Cancel()")
-
-	close(releaseChild)
-	s.must(cancelled, "Cancel() to return")
-	out.add(" after_cancel")
-
-	assert.Equal(t, " main_finished sub_finished after_cancel", out.String())
-}
-
-// Wait() returns only after the children have finished, also when the
-// handler returned first.
-func TestGracefulRunnerFinished(t *testing.T) {
-	s := newScenario(t)
-	out := &recorder{}
-	mainDone := make(chan struct{})
-	releaseChild := make(chan struct{})
-
-	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
-		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			if s.await(releaseChild) {
-				out.add(" sub_finished")
-			}
-		})
-
-		out.add(" main_finished")
-		close(mainDone)
-	})
-
-	var err error
-	waited := make(chan struct{})
-	go func() {
-		_, err = runner.Wait()
-		close(waited)
-	}()
-
-	s.must(mainDone, "the handler to finish")
-	s.mustStillBlock(waited, "Wait()")
-
-	close(releaseChild)
-	s.must(waited, "Wait() to return")
-
-	assert.NoError(t, err)
-	assert.Equal(t, " main_finished sub_finished", out.String())
-}
-
-// A handler that fails cancels its children, and Wait() reports the error
-// after the children have finished.
-func TestGracefulRunnerFail(t *testing.T) {
-	s := newScenario(t)
-	out := &recorder{}
-	mainDone := make(chan struct{})
+	handlerCancelled := make(chan struct{})
 	childCancelled := make(chan struct{})
 	releaseChild := make(chan struct{})
+	childFinished := make(chan struct{})
 
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
@@ -191,51 +116,153 @@ func TestGracefulRunnerFail(t *testing.T) {
 			close(childCancelled)
 
 			if s.await(releaseChild) {
-				out.add(" sub_finished")
+				close(childFinished)
 			}
 		})
 
-		ctx.Fail(errors.New("simulated failure"))
+		close(started)
 		if s.await(ctx.Done()) {
-			out.add(" main_finished")
+			close(handlerCancelled)
 		}
-		close(mainDone)
 	})
 
-	var err error
-	waited := make(chan struct{})
+	s.must(started, "the handler to start")
+
+	cancelReturned := make(chan struct{})
 	go func() {
-		_, err = runner.Wait()
-		close(waited)
+		runner.Cancel()
+		close(cancelReturned)
 	}()
 
-	s.must(mainDone, "the failed handler to finish")
-	s.must(childCancelled, "the failure to cancel the child")
-	s.mustStillBlock(waited, "Wait()")
+	s.must(handlerCancelled, "the cancellation to reach the handler")
+	s.must(childCancelled, "the cancellation to reach the child")
+	s.mustStillBlock(cancelReturned, "Cancel()")
 
 	close(releaseChild)
-	s.must(waited, "Wait() to return")
+	s.must(cancelReturned, "Cancel() to return")
+	s.must(childFinished, "the child to have finished when Cancel() returned")
 
-	assert.EqualError(t, err, "simulated failure")
-	assert.Equal(t, " main_finished sub_finished", out.String())
+	done, res := wait(runner)
+	s.must(done, "Wait() to return")
+	assert.True(t, res.cancelled)
+	assert.Error(t, res.err)
 }
 
-// Wait() reads the runner's error under the lock that Fail() writes it
-// with. A parent that is cancelled cancels its children, also one whose
-// handler returns at that moment, and RunWithPerseverance reads a child's
-// result in exactly this way.
+// Wait() returns only after the children have finished, also when the
+// handler returned first. A handler that returned without being failed is
+// reported as neither cancelled nor failed.
+func TestGracefulRunnerFinished(t *testing.T) {
+	s := newScenario(t)
+	handlerReturning := make(chan struct{})
+	releaseChild := make(chan struct{})
+	childFinished := make(chan struct{})
+
+	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
+		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+			if s.await(releaseChild) {
+				close(childFinished)
+			}
+		})
+
+		close(handlerReturning)
+	})
+
+	done, res := wait(runner)
+
+	s.must(handlerReturning, "the handler to return")
+	s.mustStillBlock(done, "Wait()")
+
+	close(releaseChild)
+	s.must(done, "Wait() to return")
+	s.must(childFinished, "the child to have finished when Wait() returned")
+
+	assert.False(t, res.cancelled)
+	assert.NoError(t, res.err)
+}
+
+// A handler that fails cancels its children, and Wait() reports the error
+// after the children have finished.
+func TestGracefulRunnerFail(t *testing.T) {
+	s := newScenario(t)
+	failure := errors.New("simulated failure")
+	handlerReturning := make(chan struct{})
+	childCancelled := make(chan struct{})
+	releaseChild := make(chan struct{})
+	childFinished := make(chan struct{})
+
+	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
+		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+			if !s.await(childCtx.Done()) {
+				return
+			}
+			close(childCancelled)
+
+			if s.await(releaseChild) {
+				close(childFinished)
+			}
+		})
+
+		ctx.Fail(failure)
+		s.await(ctx.Done())
+		close(handlerReturning)
+	})
+
+	done, res := wait(runner)
+
+	s.must(handlerReturning, "the failed handler to return")
+	s.must(childCancelled, "the failure to cancel the child")
+	s.mustStillBlock(done, "Wait()")
+
+	close(releaseChild)
+	s.must(done, "Wait() to return")
+	s.must(childFinished, "the child to have finished when Wait() returned")
+
+	assert.False(t, res.cancelled)
+	assert.Same(t, failure, res.err)
+}
+
+// Cancelling a runner whose handler has already returned does not change
+// its result. The parent of a child does exactly that when it is cancelled
+// at the moment the child returns, and RunWithPerseverance decides from
+// this result whether an attempt was cancelled.
+func TestGracefulRunnerCancelAfterHandlerReturned(t *testing.T) {
+	s := newScenario(t)
+	results := make(chan [2]waitResult, 1)
+
+	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
+		child := ctx.RunAsChild(func(childCtx utils.GracefulContext) {})
+
+		var before, after waitResult
+		before.cancelled, before.err = child.Wait()
+		child.Cancel()
+		after.cancelled, after.err = child.Wait()
+
+		results <- [2]waitResult{before, after}
+	})
+
+	done, _ := wait(runner)
+	s.must(done, "Wait() to return")
+
+	res := <-results
+	assert.Equal(t, waitResult{}, res[0], "result of a child that returned by itself")
+	assert.Equal(t, waitResult{}, res[1], "result after a late Cancel()")
+}
+
+// Wait() must not race with the cancellation that a parent sends to a
+// child whose handler returns at the same moment.
 //
-// This is a race-detector test: without -race it only checks that the
-// result is one of the two valid ones. It repeats the overlap many times,
-// because the detector reports a race only when it happens. With the lock
-// removed it fails within the first iterations.
+// The outcome of that overlap is one of two: the child returned first, or
+// the cancellation reached it first. This test checks that the two values
+// Wait() returns always agree with each other, and gives the race detector
+// many overlaps to look at. Reading the result without the lock is
+// reported within the first iterations.
 func TestGracefulChildWaitDuringParentCancel(t *testing.T) {
 	s := newScenario(t)
 
 	for i := 0; i < 1000; i++ {
 		ready := make(chan struct{})
 		release := make(chan struct{})
-		results := make(chan error, 1)
+		results := make(chan waitResult, 1)
 
 		runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 			child := ctx.RunAsChild(func(childCtx utils.GracefulContext) {
@@ -243,25 +270,28 @@ func TestGracefulChildWaitDuringParentCancel(t *testing.T) {
 			})
 
 			close(ready)
-			_, err := child.Wait()
-			results <- err
+
+			var res waitResult
+			res.cancelled, res.err = child.Wait()
+			results <- res
 		})
 
 		s.must(ready, "the handler to start its child")
 
-		cancelled := make(chan struct{})
+		cancelReturned := make(chan struct{})
 		go func() {
 			runner.Cancel()
-			close(cancelled)
+			close(cancelReturned)
 		}()
 		close(release)
 
-		s.must(cancelled, "Cancel() to return")
+		s.must(cancelReturned, "Cancel() to return")
 
-		// The child either finished before the cancellation reached it,
-		// or it was cancelled. Nothing else is a valid result.
-		if err := <-results; err != nil {
-			assert.EqualError(t, err, "cancelled execution")
+		res := <-results
+		if res.cancelled {
+			assert.Error(t, res.err, "a cancelled child reports the cancellation as its error")
+		} else {
+			assert.NoError(t, res.err, "a child that was not cancelled or failed reports no error")
 		}
 	}
 }

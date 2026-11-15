@@ -68,3 +68,14 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      # Link the program the way the Dockerfile does. "go build ./..."
+      # compiles every package but throws the result away without linking.
+      - name: Link the program
+        run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/*.go
+
+      # A 386 program runs on the amd64 runner, so the tests can run on a
+      # 32-bit target too. The race detector does not exist for 386.
+      - name: Test (32-bit)
+        if: matrix.arch == '386'
+        run: go test -count=1 -timeout 120s ./...
