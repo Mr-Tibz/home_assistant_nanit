@@ -4,14 +4,12 @@ import (
 	"errors"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 )
 
-// recorder collects the order of events from several goroutines. The tests
-// used a plain string for this, which the race detector reports.
+// recorder collects the order of events from several goroutines.
 type recorder struct {
 	mu  sync.Mutex
 	out string
@@ -29,38 +27,50 @@ func (r *recorder) String() string {
 	return r.out
 }
 
+// The tests below order their events with channels, not with sleeps, so
+// that they do not depend on how fast the machine schedules goroutines.
+
+// A cancelled runner waits for its handler and for the children of that
+// handler, also when a child finishes after the handler itself.
 func TestGracefulRunner(t *testing.T) {
 	out := &recorder{}
+	started := make(chan struct{})
+	mainDone := make(chan struct{})
 
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			<-childCtx.Done()
-			time.Sleep(500 * time.Millisecond)
+			<-mainDone
 			out.add(" sub_finished")
 		})
 
+		close(started)
 		<-ctx.Done()
-		time.Sleep(200 * time.Millisecond)
 		out.add(" main_finished")
+		close(mainDone)
 	})
 
-	time.Sleep(100 * time.Millisecond)
+	<-started
 	runner.Cancel()
 	out.add(" after_cancel")
 
 	assert.Equal(t, " main_finished sub_finished after_cancel", out.String())
 }
 
+// Wait() returns only after the children have finished, also when the
+// handler returned first.
 func TestGracefulRunnerFinished(t *testing.T) {
 	out := &recorder{}
+	mainDone := make(chan struct{})
+
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			time.Sleep(300 * time.Millisecond)
+			<-mainDone
 			out.add(" sub_finished")
 		})
 
-		time.Sleep(200 * time.Millisecond)
 		out.add(" main_finished")
+		close(mainDone)
 	})
 
 	_, err := runner.Wait()
@@ -68,25 +78,22 @@ func TestGracefulRunnerFinished(t *testing.T) {
 	assert.Equal(t, " main_finished sub_finished", out.String())
 }
 
+// A handler that fails cancels its children, and Wait() reports the error.
 func TestGracefulRunnerFail(t *testing.T) {
 	out := &recorder{}
+	mainDone := make(chan struct{})
+
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			<-childCtx.Done()
-			time.Sleep(200 * time.Millisecond)
+			<-mainDone
 			out.add(" sub_finished")
 		})
 
-		for {
-			select {
-			case <-time.After(200 * time.Millisecond):
-				ctx.Fail(errors.New("simulated failure"))
-			case <-ctx.Done():
-				time.Sleep(100 * time.Millisecond)
-				out.add(" main_finished")
-				return
-			}
-		}
+		ctx.Fail(errors.New("simulated failure"))
+		<-ctx.Done()
+		out.add(" main_finished")
+		close(mainDone)
 	})
 
 	_, err := runner.Wait()

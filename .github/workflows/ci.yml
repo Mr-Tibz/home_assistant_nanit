@@ -8,9 +8,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to a pull request replaces the older run. Runs on main are
+# never cancelled, so that every merge commit is tested on its own.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   go:
@@ -19,10 +21,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -34,3 +36,13 @@ jobs:
 
       - name: Test
         run: go test -race -count=1 ./...
+
+      # The published images are built without cgo for several
+      # architectures. Compile for each of them, so that code which only
+      # builds on amd64 is caught here and not at release time.
+      - name: Cross-compile
+        run: |
+          for arch in amd64 386 arm arm64; do
+            echo "linux/$arch"
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build ./...
+          done
