@@ -271,23 +271,33 @@ func (conn *WebsocketConnection) handleMessage(m *Message) {
 // that long: no message, no ping and no answer to a ping. A connection
 // can stop carrying data without any sign, for example when a router
 // between the two ends restarts. Only the missing data shows that.
+//
+// The limit starts to apply when the first ping or answer to a ping of
+// the other end has arrived. Until then nothing says that the other end
+// takes part in the pings at all, and a camera can be quiet for longer
+// than the limit: without this, such a connection would be ended and made
+// again without end.
 func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
+	pingsSeen := false
+
 	extend := func() {
-		if idleTimeout > 0 {
+		if idleTimeout > 0 && pingsSeen {
 			conn.socket.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 	}
 
 	conn.socket.SetPongHandler(func(string) error {
+		pingsSeen = true
 		extend()
 		return nil
 	})
 
-	// A ping of the other end shows as well that the connection carries
-	// data. It is answered, as the library does by itself without this
-	// handler. An answer that cannot be written needs no handling here:
-	// the connection is broken then, and the next read reports that.
+	// A ping of the other end is answered, as the library does by itself
+	// without this handler. An answer that cannot be written needs no
+	// handling here: the connection is broken then, and the next read
+	// reports that.
 	conn.socket.SetPingHandler(func(message string) error {
+		pingsSeen = true
 		extend()
 		conn.socket.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(writeTimeout))
 		return nil

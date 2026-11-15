@@ -18,12 +18,20 @@ import (
 func websocketOpts() app.WebsocketOpts {
 	opts := app.WebsocketOpts{
 		PingInterval: utils.EnvVarSeconds("NANIT_WS_PING_INTERVAL", client.DefaultPingInterval),
-		IdleTimeout:  utils.EnvVarSeconds("NANIT_WS_IDLE_TIMEOUT", client.DefaultIdleTimeout),
 	}
 
 	if opts.PingInterval <= 0 {
 		log.Fatal().Msg("Invalid NANIT_WS_PING_INTERVAL. It must be 1 or more.")
 	}
+
+	// The default idle limit follows the ping interval, so that a change
+	// of the interval alone gives a pair of values that fit
+	defaultIdleTimeout := client.DefaultIdleTimeout
+	if minimum := 3 * opts.PingInterval; defaultIdleTimeout < minimum {
+		defaultIdleTimeout = minimum
+	}
+
+	opts.IdleTimeout = utils.EnvVarSeconds("NANIT_WS_IDLE_TIMEOUT", defaultIdleTimeout)
 
 	if opts.IdleTimeout == 0 {
 		// 0 turns the idle limit off. In the options, a negative value
@@ -32,7 +40,7 @@ func websocketOpts() app.WebsocketOpts {
 	} else if opts.IdleTimeout < 2*opts.PingInterval {
 		// With less than two intervals, one answer to a ping that is
 		// late would end a connection that works
-		log.Fatal().Msgf("NANIT_WS_IDLE_TIMEOUT (%v) must be at least two times NANIT_WS_PING_INTERVAL (%v), or 0 to turn the limit off. Both have a default, see .env.sample.", opts.IdleTimeout, opts.PingInterval)
+		log.Fatal().Msgf("NANIT_WS_IDLE_TIMEOUT (%v) must be at least two times NANIT_WS_PING_INTERVAL (%v), or 0 to turn the limit off", opts.IdleTimeout, opts.PingInterval)
 	}
 
 	return opts

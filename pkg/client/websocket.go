@@ -62,24 +62,34 @@ var reconnectCooldown = []time.Duration{
 // and the making of the connection.
 const reconnectResetThreshold = 60 * time.Second
 
-// shortConnection - a connection that the other end closes within this
-// time counts as refused, like a handshake that is answered with a
-// refusal
+// shortConnection - a connection that the server closes within this time
+// counts as refused, like a handshake that is answered with a refusal
 const shortConnection = 10 * time.Second
+
+// closedByServer reports whether reason says that the server has closed
+// the connection with a close message. A connection that breaks without
+// one, that reaches its idle limit or that cannot be written to has not
+// been refused.
+func closedByServer(reason error) bool {
+	var closeErr *websocket.CloseError
+
+	return errors.As(reason, &closeErr) && closeErr.Code != websocket.CloseAbnormalClosure
+}
 
 // refusalPauses - extra pause after attempts in a row that the server has
 // refused: none after the first one, refusalPauses[0] after the second
 // one, and so on, the last entry from then on. The server has refused an
 // attempt when it answers the handshake with a 4xx status, or accepts the
-// connection and closes it within shortConnection.
+// connection and closes it within shortConnection (see closedByServer).
 //
 // The short pauses of reconnectCooldown are for failures that pass, like
 // an outage of the network. A refusal is an answer, and asking again at
-// once does not change it. After the first one the token is replaced if
-// the answer names it as the cause. When the server refuses again,
-// something else is the cause, for example a camera that is switched off
-// or that the account may no longer use, and asking every 30 seconds for
-// as long as that lasts could get the account blocked.
+// once does not change it. When the answer names the token as the cause,
+// the next attempt comes at once, with a new token if the refused one can
+// be replaced. When the server refuses again, something else is the
+// cause, for example a camera that is switched off or that the account
+// may no longer use, and asking every 30 seconds for as long as that
+// lasts could get the account blocked.
 var refusalPauses = []time.Duration{
 	30 * time.Second,
 	time.Minute,
@@ -131,6 +141,10 @@ type WebsocketConnectionManager struct {
 	// refusedToken - the token that the server has refused. The next
 	// attempt replaces it first.
 	refusedToken string
+
+	// lastRefusedToken - the last token that the server has refused by
+	// name. A token that is refused for the first time gets no pause.
+	lastRefusedToken string
 
 	// refusals - attempts in a row that the server has refused, see
 	// refusalPauses
@@ -236,6 +250,16 @@ func (manager *WebsocketConnectionManager) noteRefusal(refusedToken string) time
 
 	if refusedToken != "" {
 		manager.refusedToken = refusedToken
+
+		if refusedToken != manager.lastRefusedToken {
+			// The first refusal of this token. The next attempt can
+			// repair that with a new token, so it is not held up, and
+			// the row of refusals starts here.
+			manager.lastRefusedToken = refusedToken
+			manager.refusals = 1
+
+			return 0
+		}
 	}
 
 	manager.refusals++
@@ -351,7 +375,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 		reason := conn.endReason()
 		log.Error().Err(reason).Msg("Disconnected from server")
 
-		if time.Since(connected) < shortConnection {
+		if closedByServer(reason) && time.Since(connected) < shortConnection {
 			refusalPauseAfter = manager.noteRefusal("")
 		} else {
 			manager.noteNoRefusal()

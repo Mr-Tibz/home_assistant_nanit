@@ -29,15 +29,16 @@ type fakeRelay struct {
 	handshakeStatuses []int
 	handshakes        int32
 
-	// silent - accept connections, but never read from them. Such a
-	// connection answers no ping, like one whose other end is gone.
-	silent bool
+	// silent - answer no ping, like a connection whose other end is
+	// gone, or like a service that takes no part in the pings. Tests
+	// change it while connections are open.
+	silent atomic.Bool
+
+	// pings - pings that were answered
+	pings int32
 
 	// closeAtOnce - close this many accepted connections right away
 	closeAtOnce int32
-
-	// stopped - closed when the test ends
-	stopped chan struct{}
 
 	// tokens - Authorization header of each handshake
 	tokens chan string
@@ -61,7 +62,6 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 	relay := &fakeRelay{
 		tokens:      make(chan string, 16),
 		connections: make(chan *relayConnection, 16),
-		stopped:     make(chan struct{}),
 	}
 
 	upgrader := websocket.Upgrader{}
@@ -81,6 +81,7 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 		}
 
 		if atomic.AddInt32(&relay.closeAtOnce, -1) >= 0 {
+			socket.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "not now"), time.Now().Add(time.Second))
 			socket.Close()
 			return
 		}
@@ -88,13 +89,15 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 		conn := &relayConnection{socket: socket, received: make(chan *Message, 16), closed: make(chan struct{})}
 		relay.connections <- conn
 
-		if relay.silent {
-			<-relay.stopped
-			socket.Close()
-			return
-		}
+		socket.SetPingHandler(func(message string) error {
+			if relay.silent.Load() {
+				return nil
+			}
 
-		// Reading also answers the pings
+			atomic.AddInt32(&relay.pings, 1)
+			return socket.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(time.Second))
+		})
+
 		for {
 			_, data, err := socket.ReadMessage()
 			if err != nil {
@@ -109,10 +112,7 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 		}
 	}))
 
-	t.Cleanup(func() {
-		close(relay.stopped)
-		relay.server.Close()
-	})
+	t.Cleanup(relay.server.Close)
 
 	return relay
 }
@@ -309,14 +309,18 @@ func TestWebsocketRequestEndsWithTheConnection(t *testing.T) {
 // makes a new connection.
 func TestWebsocketReconnectsWhenNothingArrives(t *testing.T) {
 	relay := newFakeRelay(t)
-	relay.silent = true
 
 	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
 		manager.PingInterval = 20 * time.Millisecond
-		manager.IdleTimeout = 150 * time.Millisecond
+		manager.IdleTimeout = 300 * time.Millisecond
 	})
 
 	first := await(t, tc.ready, "the first connection")
+
+	// The connection works, and then it stops carrying data
+	require.Eventually(t, func() bool { return atomic.LoadInt32(&relay.pings) >= 2 }, 5*time.Second, 5*time.Millisecond)
+	relay.silent.Store(true)
+
 	second := await(t, tc.ready, "the second connection")
 
 	assert.NotSame(t, first, second)
@@ -325,6 +329,29 @@ func TestWebsocketReconnectsWhenNothingArrives(t *testing.T) {
 	case <-first.Done():
 	default:
 		t.Fatal("the first connection was not ended")
+	}
+}
+
+// The idle limit applies from the first answer to a ping. A service that
+// takes no part in the pings keeps its connections: ending them when the
+// camera is quiet for a while would make and end connections without end.
+func TestWebsocketKeepsAConnectionToAServiceThatAnswersNoPing(t *testing.T) {
+	relay := newFakeRelay(t)
+	relay.silent.Store(true)
+
+	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
+		manager.PingInterval = 20 * time.Millisecond
+		manager.IdleTimeout = 100 * time.Millisecond
+	})
+
+	conn := await(t, tc.ready, "the connection")
+
+	select {
+	case <-conn.Done():
+		t.Fatalf("the connection ended: %v", conn.endReason())
+	case <-tc.ready:
+		t.Fatal("a second connection was made")
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
@@ -357,7 +384,7 @@ func TestWebsocketStaysWhileThePingsAreAnswered(t *testing.T) {
 // when that end answers no ping of ours.
 func TestWebsocketStaysWhileTheOtherEndSendsPings(t *testing.T) {
 	relay := newFakeRelay(t)
-	relay.silent = true
+	relay.silent.Store(true)
 
 	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
 		manager.PingInterval = time.Hour
@@ -439,14 +466,17 @@ func TestWebsocketWaitsLongerWhenTheServerKeepsRefusing(t *testing.T) {
 		manager.RefusalPauses = []time.Duration{time.Hour}
 	})
 
-	// The second attempt follows the first one at once, with the token
-	// replaced. Then comes the long pause.
-	await(t, relay.tokens, "the first handshake")
-	await(t, relay.tokens, "the second handshake")
+	// A token that is refused for the first time gets no pause: the next
+	// attempt can repair that with a new token. So the second attempt
+	// follows at once with the new token, and the third one too, because
+	// the new token was refused for the first time. Then comes the pause.
+	assert.Equal(t, "Bearer access-1", await(t, relay.tokens, "the first handshake"))
+	assert.Equal(t, "Bearer access-2", await(t, relay.tokens, "the second handshake"))
+	assert.Equal(t, "Bearer access-2", await(t, relay.tokens, "the third handshake"))
 
 	select {
 	case <-relay.tokens:
-		t.Fatal("a third attempt was made without the pause")
+		t.Fatal("a fourth attempt was made without the pause")
 	case <-time.After(300 * time.Millisecond):
 	}
 }
