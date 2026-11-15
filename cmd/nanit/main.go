@@ -26,10 +26,13 @@ func websocketOpts() app.WebsocketOpts {
 	}
 
 	if opts.IdleTimeout == 0 {
-		// 0 turns the idle limit off
+		// 0 turns the idle limit off. In the options, a negative value
+		// says so, because 0 stands for the default there.
 		opts.IdleTimeout = -1
-	} else if opts.IdleTimeout <= opts.PingInterval {
-		log.Fatal().Msg("Invalid NANIT_WS_IDLE_TIMEOUT. It must be longer than NANIT_WS_PING_INTERVAL, or 0 to turn it off.")
+	} else if opts.IdleTimeout < 2*opts.PingInterval {
+		// With less than two intervals, one answer to a ping that is
+		// late would end a connection that works
+		log.Fatal().Msgf("NANIT_WS_IDLE_TIMEOUT (%v) must be at least two times NANIT_WS_PING_INTERVAL (%v), or 0 to turn the limit off. Both have a default, see .env.sample.", opts.IdleTimeout, opts.PingInterval)
 	}
 
 	return opts

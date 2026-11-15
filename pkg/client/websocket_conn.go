@@ -44,6 +44,8 @@ type WebsocketConnection struct {
 	msgHandlersMu sync.RWMutex
 	msgHandlers   []WebsocketMessageHandler
 
+	// resHandlers - the requests that wait for their response. It is nil
+	// when the connection has ended: no response can arrive any more.
 	resHandlersMu sync.Mutex
 	resHandlers   map[int32]unhandledRequest
 
@@ -79,6 +81,10 @@ func (conn *WebsocketConnection) end(reason error) {
 		}
 
 		conn.socket.Close()
+
+		conn.resHandlersMu.Lock()
+		conn.resHandlers = nil
+		conn.resHandlersMu.Unlock()
 	})
 }
 
@@ -156,15 +162,17 @@ func (conn *WebsocketConnection) SendRequest(reqType RequestType, requestData *R
 	resC := make(chan *Response, 1)
 
 	conn.resHandlersMu.Lock()
-	conn.resHandlers[id] = unhandledRequest{
-		Request: m.Request,
-		HandleResponse: func(res *Response) {
-			select {
-			case resC <- res:
-			default:
-				// A response is waiting already
-			}
-		},
+	if conn.resHandlers != nil {
+		conn.resHandlers[id] = unhandledRequest{
+			Request: m.Request,
+			HandleResponse: func(res *Response) {
+				select {
+				case resC <- res:
+				default:
+					// A response is waiting already
+				}
+			},
+		}
 	}
 	conn.resHandlersMu.Unlock()
 
@@ -257,14 +265,13 @@ func (conn *WebsocketConnection) handleMessage(m *Message) {
 	}
 }
 
-// read reads messages until the connection ends, and returns why it has
-// ended.
+// read reads messages until the connection ends.
 //
 // With an idle limit, the connection ends when nothing has arrived for
 // that long: no message, no ping and no answer to a ping. A connection
 // can stop carrying data without any sign, for example when a router
 // between the two ends restarts. Only the missing data shows that.
-func (conn *WebsocketConnection) read(idleTimeout time.Duration) error {
+func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
 	extend := func() {
 		if idleTimeout > 0 {
 			conn.socket.SetReadDeadline(time.Now().Add(idleTimeout))
@@ -292,7 +299,7 @@ func (conn *WebsocketConnection) read(idleTimeout time.Duration) error {
 		messageType, data, err := conn.socket.ReadMessage()
 		if err != nil {
 			conn.end(err)
-			return conn.endReason()
+			return
 		}
 
 		if messageType != websocket.BinaryMessage {

@@ -33,6 +33,9 @@ type fakeRelay struct {
 	// connection answers no ping, like one whose other end is gone.
 	silent bool
 
+	// closeAtOnce - close this many accepted connections right away
+	closeAtOnce int32
+
 	// stopped - closed when the test ends
 	stopped chan struct{}
 
@@ -74,6 +77,11 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 
 		socket, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
+			return
+		}
+
+		if atomic.AddInt32(&relay.closeAtOnce, -1) >= 0 {
+			socket.Close()
 			return
 		}
 
@@ -443,17 +451,47 @@ func TestWebsocketWaitsLongerWhenTheServerKeepsRefusing(t *testing.T) {
 	}
 }
 
-// A failure that is no refusal, like a server error, gets the short
-// pauses only.
-func TestWebsocketDoesNotWaitLongerAfterServerErrors(t *testing.T) {
+// A server that accepts the connection and closes it at once refuses it
+// too, in another way.
+func TestWebsocketWaitsLongerWhenTheServerKeepsClosingAtOnce(t *testing.T) {
 	relay := newFakeRelay(t)
-	relay.handshakeStatuses = []int{502, 502, 502, 502}
+	relay.closeAtOnce = 8
 
 	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
 		manager.RefusalPauses = []time.Duration{time.Hour}
 	})
 
-	await(t, tc.ready, "the connection after four server errors")
+	await(t, relay.tokens, "the first handshake")
+	await(t, relay.tokens, "the second handshake")
+
+	select {
+	case <-relay.tokens:
+		t.Fatal("a third attempt was made without the pause")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The pause does not hold up a stop
+	stopped := make(chan struct{})
+	go func() {
+		tc.runner.Cancel()
+		close(stopped)
+	}()
+
+	await(t, stopped, "the stop of the manager")
+	assert.EqualValues(t, 0, atomic.LoadInt32(&tc.api.refreshCalls), "no token is replaced on a guess")
+}
+
+// A failure that is no refusal, like a server error, gets the short
+// pauses only, and it starts the count of the refusals again.
+func TestWebsocketDoesNotWaitLongerAfterServerErrors(t *testing.T) {
+	relay := newFakeRelay(t)
+	relay.handshakeStatuses = []int{400, 502, 400, 502, 400, 502}
+
+	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
+		manager.RefusalPauses = []time.Duration{time.Hour}
+	})
+
+	await(t, tc.ready, "the connection after refusals that did not follow each other")
 }
 
 // A handler may have a last message to send when the connection is given
