@@ -329,6 +329,24 @@ func TestAuthorizeWithoutCredentialsDoesNotLogIn(t *testing.T) {
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
 }
 
+// When the server no longer accepts the refresh token of the session, a
+// configured one that differs is tried: the owner may have just set a new
+// one.
+func TestAuthorizeTriesTheConfiguredRefreshTokenAfterTheOneOfTheSession(t *testing.T) {
+	api := newFakeAPI(t)
+	api.rotate = true
+	api.validRefresh = "configured"
+	c := newTestClient(t, api)
+	c.Email, c.Password = "", ""
+	c.RefreshToken = "configured"
+
+	require.NoError(t, c.authorize())
+
+	assert.EqualValues(t, 2, atomic.LoadInt32(&api.refreshCalls), "the token of the session first, then the configured one")
+	assert.Equal(t, "rotated-refresh-1", c.SessionStore.Snapshot().RefreshToken)
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
+}
+
 // The renewal before a new attempt to connect is a precaution. If the
 // server answers it with an error of its own, the caller goes on with the
 // token of the session, as long as that token should still be valid.

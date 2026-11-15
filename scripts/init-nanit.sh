@@ -86,11 +86,9 @@ if [ "$DEBUG" = true ] ; then
     echo "SESSION_JSON Result: $SESSION_JSON"
 fi
 
-# The file holds tokens that give full access to the account. Only its
-# owner may read it, from the first byte on: a new file is created private,
-# and a file that exists is made private before the tokens are written.
+# The file holds tokens that give full access to the account, so a new
+# file is created readable by its owner only. A file that exists keeps its
+# mode, as it does when the program saves it.
 umask 077
-touch /data/session.json
-chmod 600 /data/session.json
 
 echo "$SESSION_JSON" > /data/session.json

@@ -23,7 +23,7 @@ Run the bundled init-nanit.sh utility directly via the Docker command line to ac
 ** Important Note regarding Security**
 The refresh token provides complete access to your Nanit account without requiring any additional account information, so be sure to protect your system from access by unauthorized parties, and proceed at your own risk.
 
-The script makes `session.json` readable by its owner only. The program keeps the mode and the owner of a session file that exists. If your file comes from an earlier version, it may be readable by every user of the system: run `chmod 600 /path/to/data/session.json` once.
+The script creates `session.json` readable by its owner only. A session file that exists keeps its mode and its owner, both when the script writes it and when the program saves it. If your file comes from an earlier version, it may be readable by every user of the system: run `chmod 600 /path/to/data/session.json` once.
 
 ## Docker Run
 

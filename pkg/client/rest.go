@@ -260,17 +260,28 @@ func (c *NanitClient) tokenForRequest() (token string, seen uint64) {
 	return c.AuthToken(), c.authRuns.Load()
 }
 
-// authorize gets a new auth token: with the refresh token, or with the
+// authorize gets a new auth token: with a refresh token, or with the
 // e-mail address and password when there is no refresh token or the
-// server says that it is no longer valid. The caller holds authMutex.
+// server says that none is valid any more. The caller holds authMutex.
 func (c *NanitClient) authorize() error {
-	// A session without a refresh token starts with the configured one
-	refreshToken := c.SessionStore.Snapshot().RefreshToken
-	if refreshToken == "" {
-		refreshToken = c.RefreshToken
+	// The refresh token of the session comes first. The configured one
+	// starts a session that has none, and it is tried when the server no
+	// longer accepts the one of the session: it may be a new one that
+	// the owner has just set.
+	refreshTokens := []string{c.SessionStore.Snapshot().RefreshToken}
+	if c.RefreshToken != refreshTokens[0] {
+		refreshTokens = append(refreshTokens, c.RefreshToken)
 	}
 
-	if refreshToken != "" {
+	hadRefreshToken := false
+
+	for _, refreshToken := range refreshTokens {
+		if refreshToken == "" {
+			continue
+		}
+
+		hadRefreshToken = true
+
 		err := c.renewSession(refreshToken) // We have a refresh token, so we'll use that to extend our session
 		if err == nil {
 			return nil
@@ -284,7 +295,7 @@ func (c *NanitClient) authorize() error {
 	if c.Email == "" || c.Password == "" {
 		// A login without them cannot work, and its refusal would hide
 		// the cause.
-		if refreshToken != "" {
+		if hadRefreshToken {
 			return errors.New("the refresh token is no longer valid, and no e-mail address and password are configured for a login. Get a new refresh token with init-nanit.sh (see the README)")
 		}
 
@@ -313,7 +324,7 @@ func (c *NanitClient) renewSession(refreshToken string) error {
 
 	defer r.Body.Close()
 	if r.StatusCode == 404 {
-		log.Warn().Msg("Server responded with code 404. This typically means your refresh token has expired. Will try to login with username/password")
+		log.Warn().Msg("Server responded with code 404. This typically means your refresh token has expired")
 		return ErrExpiredRefreshToken
 	} else if r.StatusCode > 299 || r.StatusCode < 200 {
 		return statusError("unable to renew session", r.StatusCode)

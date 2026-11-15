@@ -68,22 +68,17 @@ func (app *App) Run(ctx utils.GracefulContext) {
 	//
 	// A failure that can pass, like no network yet after a boot, is tried
 	// again. Any other failure ends the program.
+	if !retryAtStart(ctx, "authorize", func() error { return app.RestClient.MaybeAuthorize(false) }) {
+		return
+	}
+
 	var babies []baby.Baby
 
-	for _, step := range []struct {
-		what string
-		run  func() error
-	}{
-		{"authorize", func() error { return app.RestClient.MaybeAuthorize(false) }},
-		{"fetch the baby list", func() (err error) { babies, err = app.RestClient.EnsureBabies(); return err }},
-	} {
-		err := client.RetryTemporary(ctx.Done(), startupWaits, step.what, step.run)
-		if errors.Is(err, client.ErrRetryCancelled) {
-			return
-		}
-		if err != nil {
-			log.Fatal().Err(err).Msgf("Unable to %v", step.what)
-		}
+	if !retryAtStart(ctx, "fetch the baby list", func() (err error) {
+		babies, err = app.RestClient.EnsureBabies()
+		return err
+	}) {
+		return
 	}
 
 	// RTMP
@@ -112,6 +107,22 @@ func (app *App) Run(ctx utils.GracefulContext) {
 	}
 
 	<-ctx.Done()
+}
+
+// retryAtStart runs a step of the start until it succeeds. It tries
+// again after a failure that can pass, and ends the program after any
+// other failure. It returns false when the program is told to stop
+// first.
+func retryAtStart(ctx utils.GracefulContext, what string, step func() error) bool {
+	err := client.RetryTemporary(ctx.Done(), startupWaits, what, step)
+	if errors.Is(err, client.ErrRetryCancelled) {
+		return false
+	}
+	if err != nil {
+		log.Fatal().Err(err).Msgf("Unable to %v", what)
+	}
+
+	return true
 }
 
 func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {

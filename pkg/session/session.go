@@ -151,23 +151,23 @@ func (store *Store) marshal() ([]byte, error) {
 
 // write puts data in the session file. The caller holds store.fileMu.
 //
-// It replaces the file in one step (see replaceFile). When that is not
-// possible, it rewrites the file in place:
+// It replaces the file in one step (see replaceFile). In two cases it
+// rewrites the file in place when that is not possible:
 //
-//   - A cause that lies in the place of the file (see placeRefuses) does
-//     not pass. The file is rewritten in place, now and at every
+//   - The cause lies in the place of the file (see placeRefuses). It
+//     does not pass, so the file is rewritten in place, now and at every
 //     following save.
-//   - Any other cause, such as a full disk, can pass. The file is
-//     rewritten in place for this save, but only if the new content fits
-//     in the space that the file already has. On a file system that
-//     overwrites in place, the rewrite then needs no new space, so it
-//     works on a full disk and cannot stop half-way for the lack of
-//     space. On a file system that writes every change to a new place,
-//     it fails on a full disk and leaves the file as it is. Not trying
-//     would be worse: the server may have replaced the refresh token
-//     already. If the content does not fit, the file is left as it is
-//     and the failure is returned. The next save tries to replace the
-//     file again.
+//   - The disk is full, and the new content fits in the space that the
+//     file already has. On a file system that overwrites in place, the
+//     rewrite then needs no new space, so it works and cannot stop
+//     half-way for the lack of space. On a file system that writes
+//     every change to a new place, it fails and leaves the file as it
+//     is. Not trying would be worse: the server may have replaced the
+//     refresh token already. The next save tries to replace the file
+//     again.
+//
+// After every other failure, such as a read or write error of the disk,
+// the file is left as it is and the failure is returned.
 func (store *Store) write(data []byte) error {
 	if !store.inPlace {
 		err := replaceFile(store.Filename, data)
@@ -182,7 +182,7 @@ func (store *Store) write(data []byte) error {
 			// would hold the tokens each time and help nothing.
 			store.inPlace = true
 			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file cannot be replaced in one step in this place. It is rewritten in place until the program ends, and a crash in the middle of a save can damage it")
-		case fitsInPlace(store.Filename, data):
+		case diskFull(err) && fitsInPlace(store.Filename, data):
 			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file could not be replaced in one step. It is rewritten in place for this save")
 		default:
 			return err
@@ -190,6 +190,12 @@ func (store *Store) write(data []byte) error {
 	}
 
 	return writeFileInPlace(store.Filename, data)
+}
+
+// diskFull reports whether err says that there is no space left for this
+// user on the file system.
+func diskFull(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
 }
 
 // fitsInPlace reports whether filename exists and has room for data in

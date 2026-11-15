@@ -328,6 +328,22 @@ func TestAFullDiskDoesNotCreateTheFileInPlace(t *testing.T) {
 	assert.Empty(t, fileNames(t, filepath.Dir(store.Filename)))
 }
 
+// A failing disk is no reason to write into the one good copy.
+func TestADiskErrorDoesNotLeadToTheRewriteInPlace(t *testing.T) {
+	store := newTestStore(t)
+	store.session.RefreshToken = "first"
+	require.NoError(t, store.save())
+
+	failCreateTemp(t, syscall.EIO)
+
+	store.session.RefreshToken = "other"
+	err := store.save()
+
+	assert.True(t, errors.Is(err, syscall.EIO), "got: %v", err)
+	assert.Equal(t, "first", readSession(t, store.Filename).RefreshToken, "the file is as it was")
+	assert.False(t, store.inPlace)
+}
+
 // When neither way works, the failure is reported, and the next save
 // starts with the temporary file again.
 func TestAFailureThatCanPassIsNotRemembered(t *testing.T) {
