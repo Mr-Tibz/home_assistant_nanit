@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/sacOO7/gowebsocket"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
-	"github.com/indiefan/home_assistant_nanit/pkg/session"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 	"google.golang.org/protobuf/proto"
 )
@@ -35,7 +34,6 @@ type WebsocketConnectionHandler func(*WebsocketConnection, utils.GracefulContext
 type WebsocketConnectionManager struct {
 	BabyUID          string
 	CameraUID        string
-	Session          *session.Session
 	API              *NanitClient
 	BabyStateManager *baby.StateManager
 
@@ -45,11 +43,10 @@ type WebsocketConnectionManager struct {
 }
 
 // NewWebsocketConnectionManager - constructor
-func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *session.Session, api *NanitClient, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
+func NewWebsocketConnectionManager(babyUID string, cameraUID string, api *NanitClient, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
 	manager := &WebsocketConnectionManager{
 		BabyUID:          babyUID,
 		CameraUID:        cameraUID,
-		Session:          session,
 		API:              api,
 		BabyStateManager: babyStateManager,
 	}
@@ -108,6 +105,10 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	// tried again here, with short pauses. It does not fail the attempt:
 	// the cooldown between failed attempts grows to an hour, and that
 	// would keep the stream down long after the network has come back.
+	//
+	// The time spent here counts as run time of the attempt. If the
+	// attempt fails after such a wait, RunWithPerseverance starts the
+	// next one at once and as a first try (see ResetThreshold).
 	force := attempt.GetTry() > 1
 	err := RetryTemporary(attempt.Done(), authorizeWaits, "authorize", func() error {
 		return manager.API.MaybeAuthorize(force)

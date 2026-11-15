@@ -227,6 +227,53 @@ func TestAPlaceThatCannotBeWrittenIsReported(t *testing.T) {
 	assert.True(t, errors.Is(err, fs.ErrPermission), "got: %v", err)
 }
 
+// Only a cause that lies in the place of the file leads to the rewrite in
+// place. A cause that can pass, or that says the disk is in trouble, must
+// not: the rewrite in place would then be kept until the program ends,
+// and on a full disk it could damage the file that is still good.
+func TestWhichFailuresLeadToTheRewriteInPlace(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EBUSY, syscall.EXDEV, syscall.ENOTSUP} {
+		err := refusedByPlace(&os.LinkError{Op: "rename", Old: "session.json.tmp-1", New: "session.json", Err: errno})
+
+		var cannotReplace *cannotReplaceError
+		assert.True(t, errors.As(err, &cannotReplace), "%v lies in the place of the file", errno)
+	}
+
+	for _, errno := range []syscall.Errno{syscall.ENOSPC, syscall.EMFILE, syscall.ENFILE, syscall.EIO, syscall.EDQUOT, syscall.ENOENT} {
+		cause := &os.PathError{Op: "open", Path: "session.json.tmp-1", Err: errno}
+		err := refusedByPlace(cause)
+
+		var cannotReplace *cannotReplaceError
+		assert.False(t, errors.As(err, &cannotReplace), "%v does not lie in the place of the file", errno)
+		assert.Same(t, cause, err)
+	}
+}
+
+// A failure that does not lie in the place of the file is reported, and
+// the next save tries the temporary file again.
+func TestAFailureThatCanPassDoesNotLeadToTheRewriteInPlace(t *testing.T) {
+	store := newTestStore(t)
+	store.Session.RefreshToken = "first"
+	require.NoError(t, store.Save())
+
+	// The directory of the session file is gone: no temporary file can
+	// be created there (ENOENT)
+	dir := filepath.Dir(store.Filename)
+	moved := dir + "-moved"
+	require.NoError(t, os.Rename(dir, moved))
+
+	store.Session.RefreshToken = "second"
+	assert.Error(t, store.Save())
+	assert.False(t, store.inPlace)
+
+	// It is back: the save works again, through a temporary file
+	require.NoError(t, os.Rename(moved, dir))
+	require.NoError(t, store.Save())
+
+	assert.Equal(t, "second", readSession(t, store.Filename).RefreshToken)
+	assert.False(t, store.inPlace)
+}
+
 func TestSyncUnsupported(t *testing.T) {
 	for _, errno := range []syscall.Errno{syscall.EINVAL, syscall.ENOTSUP, syscall.ENOSYS} {
 		err := &os.PathError{Op: "sync", Path: "session.json", Err: errno}

@@ -114,7 +114,7 @@ func (app *App) Run(ctx utils.GracefulContext) {
 func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 	if app.Opts.RTMP != nil || app.MQTTConnection != nil {
 		// Websocket connection
-		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.SessionStore.Session, app.RestClient, app.BabyStateManager)
+		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.RestClient, app.BabyStateManager)
 
 		ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
 			app.runWebsocket(baby.UID, conn, childCtx)

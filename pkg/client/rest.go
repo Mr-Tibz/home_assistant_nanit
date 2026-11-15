@@ -153,10 +153,13 @@ type NanitClient struct {
 	// two renewals at the same moment, the second one is refused.
 	authMutex sync.Mutex
 
-	// authCount counts the authorizations that gave a new token. A caller
-	// that had to wait for its turn sees from it that another caller has
-	// got a new token in the meantime, and does not ask for one more.
-	authCount atomic.Uint64
+	// authRuns counts the authorizations that have ended, and lastAuthErr
+	// is the result of the latest one. A caller that had to wait for its
+	// turn sees from the count that an authorization has run in the
+	// meantime. It takes that result and makes no request of its own.
+	// authMutex guards lastAuthErr.
+	authRuns    atomic.Uint64
+	lastAuthErr error
 }
 
 func (c *NanitClient) url(path string) string {
@@ -174,53 +177,49 @@ func (c *NanitClient) AuthToken() string {
 
 // MaybeAuthorize - Performs authorization if we don't have token or we assume it is expired
 //
-// With force it asks for a new token in every case, with one exception:
-// when another caller has got a new token while this one waited for its
-// turn, that token is new enough.
+// With force it asks for a new token also when the session has one that
+// should still be valid.
+//
+// Callers at the same moment share one authorization: a caller that had
+// to wait for its turn gets the result of the authorization that ran in
+// the meantime, a new token or the failure, and makes no request of its
+// own.
 //
 // It returns an error if the authorization was needed and failed. Use
 // IsTemporary to tell a failure that is worth another try from one that
 // is not.
 func (c *NanitClient) MaybeAuthorize(force bool) error {
-	seen := c.authCount.Load()
+	seen := c.authRuns.Load()
 
-	c.authMutex.Lock()
-	defer c.authMutex.Unlock()
-
-	if c.authCount.Load() != seen {
-		return nil
+	if !force {
+		current := c.SessionStore.Snapshot()
+		if current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife {
+			return nil
+		}
 	}
 
-	current := c.SessionStore.Snapshot()
-	if !force && current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife {
-		return nil
-	}
-
-	return c.authorize()
+	return c.authorizeAfter(seen)
 }
 
-// Authorize - performs authorization attempt
-func (c *NanitClient) Authorize() error {
-	c.authMutex.Lock()
-	defer c.authMutex.Unlock()
-
-	return c.authorize()
-}
-
-// authorizeAfter performs an authorization, unless one has given a new
-// token since the caller read seen from authCount.
+// authorizeAfter performs an authorization. If one has ended since the
+// caller read seen from authRuns, it returns the result of that one.
 func (c *NanitClient) authorizeAfter(seen uint64) error {
 	c.authMutex.Lock()
 	defer c.authMutex.Unlock()
 
-	if c.authCount.Load() != seen {
-		return nil
+	if c.authRuns.Load() != seen {
+		return c.lastAuthErr
 	}
 
-	return c.authorize()
+	c.lastAuthErr = c.authorize()
+	c.authRuns.Add(1)
+
+	return c.lastAuthErr
 }
 
-// authorize does the work of Authorize. The caller holds authMutex.
+// authorize gets a new auth token: with the refresh token, or with the
+// e-mail address and password when there is no refresh token or the
+// server says that it is no longer valid. The caller holds authMutex.
 func (c *NanitClient) authorize() error {
 	// A session without a refresh token starts with the configured one
 	if c.RefreshToken != "" && c.SessionStore.Snapshot().RefreshToken == "" {
@@ -242,14 +241,7 @@ func (c *NanitClient) authorize() error {
 
 // Renews an existing session using a valid refresh token
 // If the refresh token has also expired, we need to perform a full re-login
-func (c *NanitClient) RenewSession() error {
-	c.authMutex.Lock()
-	defer c.authMutex.Unlock()
-
-	return c.renewSession()
-}
-
-// renewSession does the work of RenewSession. The caller holds authMutex.
+// The caller holds authMutex.
 func (c *NanitClient) renewSession() error {
 	requestBody, requestBodyErr := json.Marshal(map[string]string{
 		"refresh_token": c.SessionStore.Snapshot().RefreshToken,
@@ -275,14 +267,8 @@ func (c *NanitClient) renewSession() error {
 	return c.storeAuthResponse(r)
 }
 
-func (c *NanitClient) Login() error {
-	c.authMutex.Lock()
-	defer c.authMutex.Unlock()
-
-	return c.login()
-}
-
-// login does the work of Login. The caller holds authMutex.
+// login gets an auth token with the e-mail address and password. The
+// caller holds authMutex.
 func (c *NanitClient) login() error {
 	log.Info().Str("email", c.Email).Str("password", utils.AnonymizeToken(c.Password, 0)).Msg("Authorizing using user credentials")
 	requestBody, requestBodyErr := json.Marshal(map[string]string{
@@ -303,6 +289,8 @@ func (c *NanitClient) login() error {
 	req.Header.Add("nanit-api-version", "1") // required if you have MFA enabled or it'll reject the request
 	r, clientErr := myClient.Do(req)
 	if clientErr != nil {
+		// The request did not get through, so the server has not judged
+		// the credentials. Sending them again later is safe.
 		return temporary("unable to fetch auth token: %w", clientErr)
 	}
 
@@ -311,7 +299,12 @@ func (c *NanitClient) login() error {
 	if r.StatusCode == 401 {
 		return errors.New("server responded with code 401. Provided credentials has not been accepted by the server. Please check if your e-mail address and password is entered correctly and that 2FA is disabled on your account")
 	} else if r.StatusCode != 201 {
-		return statusError("unable to fetch auth token", r.StatusCode)
+		// Every answer of the server to a login is final, also one that
+		// could pass (429, 5xx). Trying again would send the e-mail
+		// address and the password again and again, and a server that
+		// limits logins could answer that by locking the account. The
+		// program ends here, as it did before.
+		return fmt.Errorf("unable to fetch auth token: server responded with status code %v", r.StatusCode)
 	}
 
 	return c.storeAuthResponse(r)
@@ -375,7 +368,6 @@ func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 		return errors.New("auth response carries no access token")
 	}
 
-	c.authCount.Add(1)
 	log.Info().Str("token", utils.AnonymizeToken(authResponse.AccessToken, 4)).Msg("Authorized")
 
 	return nil
@@ -393,7 +385,7 @@ func (c *NanitClient) FetchAuthorized(req *http.Request, data interface{}) error
 		// Read the count before the token. If another caller gets a new
 		// token between the two, this request already carries it, and a
 		// refusal must not lead to one more renewal.
-		seen := c.authCount.Load()
+		seen := c.authRuns.Load()
 		token := c.AuthToken()
 
 		if token != "" {
@@ -524,8 +516,7 @@ func (c *NanitClient) FetchNewMessages(babyUID string, defaultMessageTimeout tim
 
 	// lastSeenMessageTime is older than most recent fetchedMessage, or is unset
 	if lastSeenMessageTime.Before(fetchedMessages[0].Time.Time()) {
-		lastSeenMessageTime = fetchedMessages[0].Time.Time()
-		c.SessionStore.Update(func(s *session.Session) { s.LastSeenMessageTime = lastSeenMessageTime })
+		c.rememberMessageTime(fetchedMessages[0].Time.Time())
 	}
 
 	// Only keep messages that are more recent than messageTimeoutTime
@@ -537,4 +528,17 @@ func (c *NanitClient) FetchNewMessages(babyUID string, defaultMessageTimeout tim
 	log.Debug().Msgf("%+v\n", filteredMessages)
 
 	return filteredMessages, nil
+}
+
+// rememberMessageTime stores the time of the newest message seen, unless
+// the session already holds a later one. The polls of all cameras share
+// this time, and the poll of another camera may have stored a later time
+// since this one read it. The time must not go back, or that camera
+// would report its newest messages a second time.
+func (c *NanitClient) rememberMessageTime(newest time.Time) {
+	c.SessionStore.Update(func(s *session.Session) {
+		if s.LastSeenMessageTime.Before(newest) {
+			s.LastSeenMessageTime = newest
+		}
+	})
 }

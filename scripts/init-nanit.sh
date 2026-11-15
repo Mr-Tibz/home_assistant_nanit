@@ -87,3 +87,6 @@ if [ "$DEBUG" = true ] ; then
 fi
 
 echo "$SESSION_JSON" > /data/session.json
+
+# The file holds tokens that give full access to the account
+chmod 600 /data/session.json

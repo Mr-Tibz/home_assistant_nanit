@@ -151,7 +151,7 @@ func TestRenewSessionStoresTheNewTokens(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 
-	require.NoError(t, c.RenewSession())
+	require.NoError(t, c.renewSession())
 
 	assert.Equal(t, "refresh-1", api.lastRefresh.Load(), "the request carries the current refresh token")
 	assert.Equal(t, "access-2", c.SessionStore.Session.AuthToken)
@@ -177,7 +177,7 @@ func TestRenewSessionReportsTemporaryFailures(t *testing.T) {
 			c := newTestClient(t, api)
 			breakIt(api)
 
-			err := c.RenewSession()
+			err := c.renewSession()
 
 			require.Error(t, err)
 			assert.True(t, IsTemporary(err), "expected a temporary error, got: %v", err)
@@ -192,7 +192,7 @@ func TestRenewSessionReportsARefusalAsPermanent(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshStatus = http.StatusBadRequest
 
-	err := c.RenewSession()
+	err := c.renewSession()
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err))
@@ -204,7 +204,7 @@ func TestAuthorizeLogsInWhenTheRefreshTokenHasExpired(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshStatus = http.StatusNotFound
 
-	require.NoError(t, c.Authorize())
+	require.NoError(t, c.authorize())
 
 	assert.EqualValues(t, 1, atomic.LoadInt32(&api.loginCalls))
 	assert.Equal(t, "access-login", c.SessionStore.Session.AuthToken)
@@ -218,22 +218,41 @@ func TestAuthorizeDoesNotLogInAfterATemporaryFailure(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshStatus = http.StatusServiceUnavailable
 
-	err := c.Authorize()
+	err := c.authorize()
 
 	require.Error(t, err)
 	assert.True(t, IsTemporary(err))
 	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
 }
 
-func TestLoginReportsRefusedCredentialsAsPermanent(t *testing.T) {
+// Every answer of the server to a login is final, also one that could
+// pass. Trying again would send the e-mail address and the password again
+// and again.
+func TestLoginTakesEveryAnswerOfTheServerAsFinal(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			api := newFakeAPI(t)
+			c := newTestClient(t, api)
+			api.loginStatus = status
+
+			err := c.login()
+
+			require.Error(t, err)
+			assert.False(t, IsTemporary(err), "got: %v", err)
+		})
+	}
+}
+
+// A login that did not reach the server can be sent again.
+func TestLoginThatDidNotGetThroughIsTemporary(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
-	api.loginStatus = http.StatusUnauthorized
+	api.server.Close()
 
-	err := c.Login()
+	err := c.login()
 
 	require.Error(t, err)
-	assert.False(t, IsTemporary(err))
+	assert.True(t, IsTemporary(err), "got: %v", err)
 }
 
 func TestMaybeAuthorizeKeepsAFreshToken(t *testing.T) {
@@ -256,7 +275,7 @@ func TestAuthorizeUsesTheConfiguredRefreshToken(t *testing.T) {
 	c.SessionStore.Session.RefreshToken = ""
 	c.RefreshToken = "configured"
 
-	require.NoError(t, c.Authorize())
+	require.NoError(t, c.authorize())
 
 	assert.Equal(t, "configured", api.lastRefresh.Load())
 	assert.Equal(t, "refresh-2", c.SessionStore.Session.RefreshToken)
@@ -302,11 +321,11 @@ func TestAuthorizationsAtTheSameMomentDoNotShareARefreshToken(t *testing.T) {
 
 // A caller that waited for its turn while another caller got a new token
 // uses that token. It does not ask for one more.
-func TestAuthorizationIsNotRepeatedForACallerThatWaited(t *testing.T) {
+func TestACallerThatWaitedSharesTheNewToken(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 
-	seen := c.authCount.Load() // a caller is about to wait for its turn
+	seen := c.authRuns.Load() // a caller is about to wait for its turn
 
 	require.NoError(t, c.MaybeAuthorize(true)) // another caller is served first
 	require.NoError(t, c.authorizeAfter(seen))
@@ -314,8 +333,48 @@ func TestAuthorizationIsNotRepeatedForACallerThatWaited(t *testing.T) {
 	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "the caller that waited did not renew again")
 
 	// A caller that comes later gets a renewal of its own
-	require.NoError(t, c.authorizeAfter(c.authCount.Load()))
+	require.NoError(t, c.authorizeAfter(c.authRuns.Load()))
 	assert.EqualValues(t, 2, atomic.LoadInt32(&api.refreshCalls))
+}
+
+// A caller that waited while the authorization of another caller failed
+// gets that failure. Without this, every camera would repeat a request
+// that has just failed, one after the other, each for the full time
+// limit of a request.
+func TestACallerThatWaitedSharesTheFailure(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.refreshStatus = http.StatusBadGateway
+
+	seen := c.authRuns.Load() // a caller is about to wait for its turn
+
+	first := c.MaybeAuthorize(true) // another caller is served first, and fails
+	require.Error(t, first)
+
+	second := c.authorizeAfter(seen)
+
+	assert.Same(t, first, second)
+	assert.True(t, IsTemporary(second))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "the caller that waited made no request")
+
+	// A caller that comes later tries for itself
+	api.refreshStatus = http.StatusOK
+	require.NoError(t, c.MaybeAuthorize(true))
+	assert.EqualValues(t, 2, atomic.LoadInt32(&api.refreshCalls))
+}
+
+// A token that should still be valid needs no authorization, whatever
+// happened to the authorization of another caller in the meantime.
+func TestAFreshTokenIsEnoughWithoutForce(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	c.SessionStore.Session.AuthTime = time.Now()
+	api.refreshStatus = http.StatusBadGateway
+
+	require.Error(t, c.MaybeAuthorize(true))
+	require.NoError(t, c.MaybeAuthorize(false))
+
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls))
 }
 
 // An answer that is JSON, but not of the expected form, means that the
@@ -325,7 +384,7 @@ func TestAuthResponseOfAnUnexpectedFormIsPermanent(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshBody = `{"access_token":{"value":"access-2"}}`
 
-	err := c.RenewSession()
+	err := c.renewSession()
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err), "got: %v", err)
@@ -341,7 +400,7 @@ func TestAuthResponseWithoutAccessToken(t *testing.T) {
 	c := newTestClient(t, api)
 	api.refreshBody = `{"refresh_token":"refresh-2"}`
 
-	err := c.RenewSession()
+	err := c.renewSession()
 
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err))
@@ -597,4 +656,26 @@ func TestRetryTemporaryWithoutWaits(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("RetryTemporary did not return")
 	}
+}
+
+// The polls of all cameras share the time of the newest message seen. It
+// moves forward only: a poll that stores an older time would make another
+// camera report its newest messages a second time.
+func TestRememberMessageTimeNeverGoesBack(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+
+	t3 := time.Date(2026, 1, 1, 0, 0, 3, 0, time.UTC)
+	t5 := time.Date(2026, 1, 1, 0, 0, 5, 0, time.UTC)
+	t7 := time.Date(2026, 1, 1, 0, 0, 7, 0, time.UTC)
+
+	c.rememberMessageTime(t5)
+	assert.Equal(t, t5, c.SessionStore.Snapshot().LastSeenMessageTime)
+
+	c.rememberMessageTime(t3)
+	assert.Equal(t, t5, c.SessionStore.Snapshot().LastSeenMessageTime, "an older time does not replace a later one")
+
+	c.rememberMessageTime(t7)
+	assert.Equal(t, t7, c.SessionStore.Snapshot().LastSeenMessageTime)
+	assert.True(t, t7.Equal(storedSession(t, c).LastSeenMessageTime), "the time is saved")
 }
