@@ -150,20 +150,34 @@ func (store *Store) marshal() ([]byte, error) {
 }
 
 // write puts data in the session file. The caller holds store.fileMu.
+//
+// It replaces the file in one step (see replaceFile). When that fails,
+// for whatever reason, it rewrites the file in place. Not saving at all
+// would be worse: the server may have replaced the refresh token already,
+// and the one in the file is then no longer valid. On a full disk the
+// rewrite in place is also the way that still works, because a file of
+// this size is rewritten without new space on the common file systems.
+//
+// A cause that lies in the place of the file (see placeRefuses) does not
+// pass, so the following saves rewrite the file in place directly. After
+// any other cause, the next save tries to replace the file again.
 func (store *Store) write(data []byte) error {
 	if !store.inPlace {
 		err := replaceFile(store.Filename, data)
 
-		var cannotReplace *cannotReplaceError
-		if !errors.As(err, &cannotReplace) {
-			return err
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, errLinkWithoutFile):
+			// Opening the link for writing creates the file
+		case placeRefuses(err):
+			// Do not go through a temporary file again at every save: it
+			// would hold the tokens each time and help nothing.
+			store.inPlace = true
+			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file cannot be replaced in one step in this place. It is rewritten in place until the program ends, and a crash in the middle of a save can damage it")
+		default:
+			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file could not be replaced in one step. It is rewritten in place for this save")
 		}
-
-		// The cause lies in the place of the file and will not pass. Do
-		// not go through a temporary file again at every save: it would
-		// hold the tokens each time and help nothing.
-		store.inPlace = true
-		log.Warn().Str("filename", store.Filename).Err(cannotReplace.cause).Msg("The app session file cannot be replaced in one step in this place. It is rewritten in place until the program ends, and a crash in the middle of a save can damage it")
 	}
 
 	return writeFileInPlace(store.Filename, data)
@@ -196,61 +210,41 @@ const newSessionFileMode os.FileMode = 0600
 // its temporary files. A number follows the mark.
 const tempFileMark = ".tmp-"
 
-// cannotReplaceError - the session file cannot be replaced by a rename in
-// this place. The data is not at fault, so the file can be rewritten in
-// place.
-type cannotReplaceError struct {
-	cause error
-}
-
-func (e *cannotReplaceError) Error() string { return e.cause.Error() }
-func (e *cannotReplaceError) Unwrap() error { return e.cause }
+// errLinkWithoutFile - the session file is a symbolic link to a file that
+// does not exist yet. A rename would put a regular file in the place of
+// the link.
+var errLinkWithoutFile = errors.New("the session file is a link to a file that does not exist yet")
 
 // placeRefuses reports whether err says that the place of the session
 // file does not allow what replaceFile does there. These causes do not
-// pass by themselves, and they say nothing against the file itself.
+// pass by themselves. Every other failure, such as a full disk or too
+// many open files, can pass.
 func placeRefuses(err error) bool {
 	return errors.Is(err, fs.ErrPermission) || // the directory, or the mode or owner of the file, is not ours to change
 		errors.Is(err, syscall.EROFS) || // the directory is on a read-only file system
 		errors.Is(err, syscall.EBUSY) || // the file itself is mounted, for example into a container
 		errors.Is(err, syscall.EXDEV) || // the file is on another file system than its directory
+		errors.Is(err, syscall.ENAMETOOLONG) || // the name leaves no room for the name of a temporary file
 		errors.Is(err, errors.ErrUnsupported)
 }
 
-// refusedByPlace marks err as a cannotReplaceError when the place of the
-// file is the cause. Every other failure, such as a full disk, too many
-// open files or a read error, can pass or says that the disk is in
-// trouble. It is returned as it is: the next save tries again, and the
-// file that is still good is not touched.
-func refusedByPlace(err error) error {
-	if placeRefuses(err) {
-		return &cannotReplaceError{err}
-	}
-
-	return err
-}
+// createTemp - os.CreateTemp, which a test replaces to make it fail
+var createTemp = os.CreateTemp
 
 // replaceFile replaces the content of filename in one step: it writes
 // data to a temporary file in the same directory and renames that file
-// over filename.
+// over filename. The file that exists is not touched before the rename.
 //
 // If filename is a symbolic link, the file it points to is replaced and
 // the link stays. A file that exists keeps its mode and its owner.
 //
 // The rename is not possible everywhere, for example when the file itself
-// is mounted into a container. When the place does not allow the
-// temporary file to be created, given the mode and owner, or renamed
-// (see placeRefuses), the result is a cannotReplaceError. Every other
-// failure is returned as it is, and the file that is still good is not
-// touched.
+// is mounted into a container.
 func replaceFile(filename string, data []byte) error {
 	target, err := filepath.EvalSymlinks(filename)
 	if err != nil {
 		if isSymlink(filename) {
-			// A link to a file that does not exist yet. Opening the link
-			// for writing creates that file. A rename would put a
-			// regular file in the place of the link.
-			return writeFileInPlace(filename, data)
+			return errLinkWithoutFile
 		}
 
 		target = filename
@@ -262,35 +256,32 @@ func replaceFile(filename string, data []byte) error {
 	dir := filepath.Dir(target)
 
 	// os.CreateTemp creates the file with mode 0600
-	tmp, err := os.CreateTemp(dir, filepath.Base(target)+tempFileMark+"*")
+	tmp, err := createTemp(dir, filepath.Base(target)+tempFileMark+"*")
 	if err != nil {
-		return refusedByPlace(err)
+		return err
 	}
 
 	tmpName := tmp.Name()
-	discard := func() {
+	discard := func(err error) error {
 		tmp.Close()
 		os.Remove(tmpName)
+		return err
 	}
 
 	if exists {
 		if err := tmp.Chmod(existing.Mode().Perm()); err != nil {
-			discard()
-			return refusedByPlace(err)
+			return discard(err)
 		}
 		if err := keepOwner(tmp, existing); err != nil {
-			discard()
-			return refusedByPlace(err)
+			return discard(err)
 		}
 	}
 
 	if _, err := tmp.Write(data); err != nil {
-		discard()
-		return err
+		return discard(err)
 	}
 	if err := tmp.Sync(); err != nil && !syncUnsupported(err) {
-		discard()
-		return err
+		return discard(err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
@@ -299,7 +290,7 @@ func replaceFile(filename string, data []byte) error {
 
 	if err := os.Rename(tmpName, target); err != nil {
 		os.Remove(tmpName)
-		return refusedByPlace(err)
+		return err
 	}
 
 	// Make the rename itself durable. Not every file system supports

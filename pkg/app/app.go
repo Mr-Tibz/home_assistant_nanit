@@ -133,30 +133,32 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 }
 
 func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager) {
-	newMessages, err := app.RestClient.FetchNewMessages(babyUID, app.Opts.EventPolling.MessageTimeout)
-	if err != nil {
-		if !client.IsTemporary(err) {
-			log.Fatal().Err(err).Msg("Unable to fetch messages")
+	// A loop, and not a call of itself at the end of each round: that
+	// call added a frame to the stack of the goroutine at every round,
+	// for as long as the program ran.
+	for {
+		newMessages, err := app.RestClient.FetchNewMessages(babyUID, app.Opts.EventPolling.MessageTimeout)
+		if err != nil {
+			if !client.IsTemporary(err) {
+				log.Fatal().Err(err).Msg("Unable to fetch messages")
+			}
+
+			// Skip this round. The next one comes after the polling interval.
+			log.Warn().Err(err).Msg("Unable to fetch messages, will try again")
 		}
 
-		// Skip this round. The next one comes after the polling interval.
-		log.Warn().Err(err).Msg("Unable to fetch messages, will try again")
-	}
-
-	for _, msg := range newMessages {
-		switch msg.Type {
-		case message.SoundEventMessageType:
-			go babyStateManager.NotifySoundSubscribers(babyUID, time.Time(msg.Time))
-			break
-		case message.MotionEventMessageType:
-			go babyStateManager.NotifyMotionSubscribers(babyUID, time.Time(msg.Time))
-			break
+		for _, msg := range newMessages {
+			switch msg.Type {
+			case message.SoundEventMessageType:
+				go babyStateManager.NotifySoundSubscribers(babyUID, time.Time(msg.Time))
+			case message.MotionEventMessageType:
+				go babyStateManager.NotifyMotionSubscribers(babyUID, time.Time(msg.Time))
+			}
 		}
-	}
 
-	// wait for the specified interval
-	time.Sleep(app.Opts.EventPolling.PollingInterval)
-	app.pollMessages(babyUID, babyStateManager)
+		// wait for the specified interval
+		time.Sleep(app.Opts.EventPolling.PollingInterval)
+	}
 }
 
 func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, childCtx utils.GracefulContext) {

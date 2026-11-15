@@ -269,8 +269,9 @@ func TestLoginTakesAnAcceptedLoginWithAnUnusableAnswerAsFinal(t *testing.T) {
 	}
 }
 
-// A login that did not reach the server can be sent again.
-func TestLoginThatDidNotGetThroughIsTemporary(t *testing.T) {
+// A login that got no answer is not sent again either: the server may
+// have received it all the same.
+func TestLoginWithoutAnAnswerIsFinal(t *testing.T) {
 	api := newFakeAPI(t)
 	c := newTestClient(t, api)
 	api.server.Close()
@@ -278,7 +279,28 @@ func TestLoginThatDidNotGetThroughIsTemporary(t *testing.T) {
 	err := c.login()
 
 	require.Error(t, err)
-	assert.True(t, IsTemporary(err), "got: %v", err)
+	assert.False(t, IsTemporary(err), "got: %v", err)
+}
+
+// The answer to a login normally carries a new refresh token. If it does
+// not, the refresh token that the server has just refused is dropped, so
+// that the next authorization does not send it again.
+func TestLoginWithoutANewRefreshTokenDropsTheRefusedOne(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.refreshStatus = http.StatusNotFound
+	api.loginBody = `{"access_token":"access-login"}`
+
+	require.NoError(t, c.authorize())
+
+	assert.Equal(t, "access-login", c.SessionStore.Snapshot().AuthToken)
+	assert.Equal(t, "", c.SessionStore.Snapshot().RefreshToken)
+	assert.Equal(t, "", storedSession(t, c).RefreshToken)
+
+	// The next authorization goes to the login directly
+	require.NoError(t, c.authorize())
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls))
+	assert.EqualValues(t, 2, atomic.LoadInt32(&api.loginCalls))
 }
 
 func TestMaybeAuthorizeKeepsAFreshToken(t *testing.T) {
@@ -417,6 +439,22 @@ func TestAuthResponseOfAnUnexpectedFormIsPermanent(t *testing.T) {
 	assert.Equal(t, "access-1", c.SessionStore.Snapshot().AuthToken, "the session keeps its tokens")
 }
 
+// An answer of an unexpected form can still carry a new refresh token.
+// It is kept: the server may already have retired the old one.
+func TestAuthResponseOfAnUnexpectedFormKeepsItsRefreshToken(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.refreshBody = `{"access_token":{"value":"access-2"},"refresh_token":"refresh-2"}`
+
+	err := c.renewSession()
+
+	require.Error(t, err)
+	assert.False(t, IsTemporary(err), "got: %v", err)
+	assert.Equal(t, "access-1", c.SessionStore.Snapshot().AuthToken, "the old access token stays")
+	assert.Equal(t, "refresh-2", c.SessionStore.Snapshot().RefreshToken, "the new refresh token is kept")
+	assert.Equal(t, "refresh-2", storedSession(t, c).RefreshToken, "the new refresh token is saved")
+}
+
 // An answer that reports success but carries no access token is not
 // tried again: that would send the credentials again and again. A new
 // refresh token in it is kept, because the server may already have retired
@@ -510,7 +548,7 @@ func TestFetchAuthorizedSortsAnswersItCannotUse(t *testing.T) {
 	}{
 		"not JSON, something else answered": {`<html>Sign in to the network</html>`, true},
 		"cut off":                           {`{"babies":[{"uid":"baby-1"`, true},
-		"no content":                        {``, false},
+		"no content":                        {``, true},
 		"JSON of another form":              {`{"babies":"none"}`, false},
 	} {
 		t.Run(name, func(t *testing.T) {

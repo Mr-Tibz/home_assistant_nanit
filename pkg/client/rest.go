@@ -226,7 +226,9 @@ func (c *NanitClient) authorize() error {
 		c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = c.RefreshToken })
 	}
 
-	if c.SessionStore.Snapshot().RefreshToken != "" {
+	refused := ""
+
+	if refreshToken := c.SessionStore.Snapshot().RefreshToken; refreshToken != "" {
 		err := c.renewSession() // We have a refresh token, so we'll use that to extend our session
 		if err == nil {
 			return nil
@@ -234,9 +236,24 @@ func (c *NanitClient) authorize() error {
 		if !errors.Is(err, ErrExpiredRefreshToken) {
 			return err
 		}
+
+		refused = refreshToken
 	}
 
-	return c.login() // We don't have a refresh token, e.g. initial login so we need to supply username/password
+	// We don't have a refresh token, e.g. initial login so we need to supply username/password
+	if err := c.login(); err != nil {
+		return err
+	}
+
+	// The answer to a login normally carries a new refresh token. If it
+	// did not, the session still holds the one that the server has just
+	// refused. Drop it, as before, so that the next authorization does
+	// not send it again.
+	if refused != "" && c.SessionStore.Snapshot().RefreshToken == refused {
+		c.SessionStore.Update(func(s *session.Session) { s.RefreshToken = "" })
+	}
+
+	return nil
 }
 
 // Renews an existing session using a valid refresh token
@@ -269,6 +286,11 @@ func (c *NanitClient) renewSession() error {
 
 // login gets an auth token with the e-mail address and password. The
 // caller holds authMutex.
+//
+// No failure of a login is temporary. This program does not send the
+// e-mail address and the password a second time by itself: a server that
+// limits logins could answer that by locking the account. Every failure
+// ends the program, as it did before.
 func (c *NanitClient) login() error {
 	log.Info().Str("email", c.Email).Str("password", utils.AnonymizeToken(c.Password, 0)).Msg("Authorizing using user credentials")
 	requestBody, requestBodyErr := json.Marshal(map[string]string{
@@ -289,8 +311,9 @@ func (c *NanitClient) login() error {
 	req.Header.Add("nanit-api-version", "1") // required if you have MFA enabled or it'll reject the request
 	r, clientErr := myClient.Do(req)
 	if clientErr != nil {
-		// No answer has arrived. Only this case is tried again.
-		return temporary("unable to fetch auth token: %w", clientErr)
+		// No answer has arrived, but the server may have received the
+		// request all the same.
+		return fmt.Errorf("unable to fetch auth token: %v", clientErr)
 	}
 
 	defer r.Body.Close()
@@ -298,18 +321,11 @@ func (c *NanitClient) login() error {
 	if r.StatusCode == 401 {
 		return errors.New("server responded with code 401. Provided credentials has not been accepted by the server. Please check if your e-mail address and password is entered correctly and that 2FA is disabled on your account")
 	} else if r.StatusCode != 201 {
-		// Every answer of the server to a login is final, also one that
-		// could pass (429, 5xx). Trying again would send the e-mail
-		// address and the password again and again, and a server that
-		// limits logins could answer that by locking the account. The
-		// program ends here, as it did before.
 		return fmt.Errorf("unable to fetch auth token: server responded with status code %v", r.StatusCode)
 	}
 
 	if err := c.storeAuthResponse(r); err != nil {
-		// Final for the same reason, also when the answer was only cut
-		// off: the server has accepted the credentials. The error is
-		// formatted with %v so that it no longer counts as temporary.
+		// %v and not %w: the error must not count as temporary
 		return fmt.Errorf("unable to use the answer to the login: %v", err)
 	}
 
@@ -325,11 +341,13 @@ const maxResponseSize = 4 << 20
 // As before, the first JSON value of the body counts, and what follows it
 // is ignored.
 //
-// A body that does not arrive in full, or that is not JSON, is a fault of
-// the transfer or of something that answered in the place of the server,
-// and can pass. A body without content, or JSON of another form than this
-// program expects, means that the API has changed: asking again does not
-// help.
+// A body that is not a complete JSON value (no content, cut off, or not
+// JSON at all) is a fault of the transfer or of something that answered
+// in the place of the server, and can pass. A JSON value of another form
+// than this program expects comes from the API and means that the API
+// has changed: asking again does not help.
+//
+// When the form does not fit, data still holds the fields that did fit.
 func decodeBody(r *http.Response, data interface{}) error {
 	body, readErr := io.ReadAll(io.LimitReader(r.Body, maxResponseSize))
 	if readErr != nil {
@@ -342,8 +360,8 @@ func decodeBody(r *http.Response, data interface{}) error {
 	}
 
 	var syntaxErr *json.SyntaxError
-	if errors.As(jsonErr, &syntaxErr) || errors.Is(jsonErr, io.ErrUnexpectedEOF) {
-		return temporary("the response is cut off or is not JSON: %w", jsonErr)
+	if errors.As(jsonErr, &syntaxErr) || errors.Is(jsonErr, io.EOF) || errors.Is(jsonErr, io.ErrUnexpectedEOF) {
+		return temporary("the response is not a complete JSON value: %w", jsonErr)
 	}
 
 	return fmt.Errorf("the response has an unexpected form: %w", jsonErr)
@@ -354,8 +372,11 @@ func decodeBody(r *http.Response, data interface{}) error {
 func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 	authResponse := new(authResponsePayload)
 
-	if err := decodeBody(r, authResponse); err != nil {
-		return fmt.Errorf("unable to use the auth response: %w", err)
+	decodeErr := decodeBody(r, authResponse)
+	if decodeErr != nil {
+		// Forget an access token of an answer that cannot be trusted as
+		// a whole. A refresh token in it is kept, see below.
+		authResponse.AccessToken = ""
 	}
 
 	if authResponse.RefreshToken != "" {
@@ -363,17 +384,24 @@ func (c *NanitClient) storeAuthResponse(r *http.Response) error {
 	}
 
 	// The server may retire the old refresh token as soon as it has sent
-	// a new one. Keep the new one whatever else the answer holds.
-	c.SessionStore.Update(func(s *session.Session) {
-		if authResponse.RefreshToken != "" {
-			s.RefreshToken = authResponse.RefreshToken
-		}
+	// a new one. Keep the new one whatever else the answer holds, also
+	// when another part of the answer could not be used.
+	if authResponse.RefreshToken != "" || authResponse.AccessToken != "" {
+		c.SessionStore.Update(func(s *session.Session) {
+			if authResponse.RefreshToken != "" {
+				s.RefreshToken = authResponse.RefreshToken
+			}
 
-		if authResponse.AccessToken != "" {
-			s.AuthToken = authResponse.AccessToken
-			s.AuthTime = time.Now()
-		}
-	})
+			if authResponse.AccessToken != "" {
+				s.AuthToken = authResponse.AccessToken
+				s.AuthTime = time.Now()
+			}
+		})
+	}
+
+	if decodeErr != nil {
+		return fmt.Errorf("unable to use the auth response: %w", decodeErr)
+	}
 
 	if authResponse.AccessToken == "" {
 		// Not temporary: the server answers in a way this program does

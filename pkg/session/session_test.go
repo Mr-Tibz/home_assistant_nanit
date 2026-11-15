@@ -227,37 +227,71 @@ func TestAPlaceThatCannotBeWrittenIsReported(t *testing.T) {
 	assert.True(t, errors.Is(err, fs.ErrPermission), "got: %v", err)
 }
 
-// Only a cause that lies in the place of the file leads to the rewrite in
-// place. A cause that can pass, or that says the disk is in trouble, must
-// not: the rewrite in place would then be kept until the program ends,
-// and on a full disk it could damage the file that is still good.
-func TestWhichFailuresLeadToTheRewriteInPlace(t *testing.T) {
-	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EBUSY, syscall.EXDEV, syscall.ENOTSUP} {
-		err := refusedByPlace(&os.LinkError{Op: "rename", Old: "session.json.tmp-1", New: "session.json", Err: errno})
-
-		var cannotReplace *cannotReplaceError
-		assert.True(t, errors.As(err, &cannotReplace), "%v lies in the place of the file", errno)
+// A cause that lies in the place of the file does not pass, so the
+// rewrite in place is kept until the program ends. Every other cause can
+// pass, and must not have that effect.
+func TestWhichFailuresLieInThePlaceOfTheFile(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.EACCES, syscall.EPERM, syscall.EROFS, syscall.EBUSY, syscall.EXDEV, syscall.ENAMETOOLONG, syscall.ENOTSUP} {
+		err := &os.LinkError{Op: "rename", Old: "session.json.tmp-1", New: "session.json", Err: errno}
+		assert.True(t, placeRefuses(err), "%v lies in the place of the file", errno)
 	}
 
 	for _, errno := range []syscall.Errno{syscall.ENOSPC, syscall.EMFILE, syscall.ENFILE, syscall.EIO, syscall.EDQUOT, syscall.ENOENT} {
-		cause := &os.PathError{Op: "open", Path: "session.json.tmp-1", Err: errno}
-		err := refusedByPlace(cause)
-
-		var cannotReplace *cannotReplaceError
-		assert.False(t, errors.As(err, &cannotReplace), "%v does not lie in the place of the file", errno)
-		assert.Same(t, cause, err)
+		err := &os.PathError{Op: "open", Path: "session.json.tmp-1", Err: errno}
+		assert.False(t, placeRefuses(err), "%v does not lie in the place of the file", errno)
 	}
 }
 
-// A failure that does not lie in the place of the file is reported, and
-// the next save tries the temporary file again.
-func TestAFailureThatCanPassDoesNotLeadToTheRewriteInPlace(t *testing.T) {
+// failCreateTemp makes the creation of the temporary file fail with errno
+// until the test ends.
+func failCreateTemp(t *testing.T, errno syscall.Errno) {
+	original := createTemp
+	t.Cleanup(func() { createTemp = original })
+
+	createTemp = func(dir string, pattern string) (*os.File, error) {
+		return nil, &os.PathError{Op: "open", Path: filepath.Join(dir, pattern), Err: errno}
+	}
+}
+
+// On a full disk no temporary file can be made. The file is then
+// rewritten in place, which needs no new space for a file of this size:
+// not saving would lose a refresh token that the server has replaced.
+// The next save tries the temporary file again.
+func TestAFullDiskLeadsToTheRewriteInPlaceForOneSave(t *testing.T) {
 	store := newTestStore(t)
 	store.session.RefreshToken = "first"
 	require.NoError(t, store.save())
 
-	// The directory of the session file is gone: no temporary file can
-	// be created there (ENOENT)
+	original := createTemp
+	failCreateTemp(t, syscall.ENOSPC)
+
+	store.session.RefreshToken = "second"
+	require.NoError(t, store.save())
+
+	assert.Equal(t, "second", readSession(t, store.Filename).RefreshToken)
+	assert.False(t, store.inPlace, "a full disk can pass")
+
+	// The check at the start passes on a full disk too
+	require.NoError(t, store.checkWritable())
+
+	createTemp = original
+
+	store.session.RefreshToken = "third"
+	require.NoError(t, store.save())
+
+	assert.Equal(t, "third", readSession(t, store.Filename).RefreshToken)
+	assert.False(t, store.inPlace)
+}
+
+// When neither way works, the failure is reported, and the next save
+// starts with the temporary file again.
+func TestAFailureThatCanPassIsNotRemembered(t *testing.T) {
+	store := newTestStore(t)
+	store.session.RefreshToken = "first"
+	require.NoError(t, store.save())
+
+	// The directory of the session file is gone: no file can be created
+	// or opened there (ENOENT)
 	dir := filepath.Dir(store.Filename)
 	moved := dir + "-moved"
 	require.NoError(t, os.Rename(dir, moved))
