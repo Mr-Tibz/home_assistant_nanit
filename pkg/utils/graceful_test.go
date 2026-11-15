@@ -29,88 +29,110 @@ func (r *recorder) String() string {
 }
 
 // The tests below order their events with channels, not with sleeps, so
-// that they do not depend on how fast the machine schedules goroutines.
-// Every wait has a limit, so that a broken runner fails the test with a
-// message and does not hang it.
+// that a slow machine cannot make a correct runner fail them.
+//
+// Each test holds a child back until the test goroutine has seen that
+// Cancel() or Wait() is still blocked, and releases it only then. A runner
+// that stops waiting for its children therefore fails every time.
+//
+// Goroutines started by a runner never touch the testing.T. They wait on
+// channels that the test closes when it ends, so nothing is reported after
+// the test has completed.
 
-const testTimeout = 5 * time.Second
+const (
+	// testTimeout limits every wait for something that must happen.
+	testTimeout = 5 * time.Second
 
-// within reports a failure when ch does not deliver in time. It is safe
-// to call from any goroutine.
-func within(t *testing.T, ch <-chan struct{}, what string) bool {
-	t.Helper()
+	// stillBlocked is how long a call is watched to show that it has not
+	// returned. A correct runner blocks for as long as the child is held
+	// back, so this check cannot fail by timing.
+	stillBlocked = 100 * time.Millisecond
+)
 
+// scenario gives the goroutines of a test a way to wait that ends when the
+// test ends.
+type scenario struct {
+	t    *testing.T
+	stop chan struct{}
+}
+
+func newScenario(t *testing.T) *scenario {
+	s := &scenario{t: t, stop: make(chan struct{})}
+	t.Cleanup(func() { close(s.stop) })
+	return s
+}
+
+// await blocks until ch delivers. It returns false if the test ended
+// first. It is for goroutines started by a runner.
+func (s *scenario) await(ch <-chan struct{}) bool {
 	select {
 	case <-ch:
 		return true
-	case <-time.After(testTimeout):
-		t.Errorf("timed out waiting for %s", what)
+	case <-s.stop:
 		return false
 	}
 }
 
-// cancelWithin calls runner.Cancel() and fails the test if it does not
-// return in time.
-func cancelWithin(t *testing.T, runner utils.GracefulRunner) {
-	t.Helper()
+// must waits for ch on the test goroutine and fails the test if it does
+// not deliver in time.
+func (s *scenario) must(ch <-chan struct{}, what string) {
+	s.t.Helper()
 
-	done := make(chan struct{})
-	go func() {
-		runner.Cancel()
-		close(done)
-	}()
-
-	if !within(t, done, "Cancel() to return") {
-		t.FailNow()
+	select {
+	case <-ch:
+	case <-time.After(testTimeout):
+		s.t.Fatalf("timed out waiting for %s", what)
 	}
 }
 
-// waitWithin calls runner.Wait() and fails the test if it does not return
-// in time.
-func waitWithin(t *testing.T, runner utils.GracefulRunner) (bool, error) {
-	t.Helper()
+// mustStillBlock fails the test if ch delivers although the call behind it
+// has to wait for a child that is still held back.
+func (s *scenario) mustStillBlock(ch <-chan struct{}, what string) {
+	s.t.Helper()
 
-	var cancelled bool
-	var err error
-
-	done := make(chan struct{})
-	go func() {
-		cancelled, err = runner.Wait()
-		close(done)
-	}()
-
-	if !within(t, done, "Wait() to return") {
-		t.FailNow()
+	select {
+	case <-ch:
+		s.t.Fatalf("%s returned before the child had finished", what)
+	case <-time.After(stillBlocked):
 	}
-
-	return cancelled, err
 }
 
 // A cancelled runner waits for its handler and for the children of that
 // handler, also when a child finishes after the handler itself.
 func TestGracefulRunner(t *testing.T) {
+	s := newScenario(t)
 	out := &recorder{}
 	started := make(chan struct{})
 	mainDone := make(chan struct{})
+	releaseChild := make(chan struct{})
 
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			if within(t, childCtx.Done(), "the child to be cancelled") && within(t, mainDone, "the handler to finish") {
+			if s.await(childCtx.Done()) && s.await(releaseChild) {
 				out.add(" sub_finished")
 			}
 		})
 
 		close(started)
-		if within(t, ctx.Done(), "the handler to be cancelled") {
+		if s.await(ctx.Done()) {
 			out.add(" main_finished")
 		}
 		close(mainDone)
 	})
 
-	if !within(t, started, "the handler to start") {
-		t.FailNow()
-	}
-	cancelWithin(t, runner)
+	s.must(started, "the handler to start")
+
+	cancelled := make(chan struct{})
+	go func() {
+		runner.Cancel()
+		close(cancelled)
+	}()
+
+	s.must(mainDone, "the handler to finish")
+	s.mustStillBlock(cancelled, "Cancel()")
+
+	close(releaseChild)
+	s.must(cancelled, "Cancel() to return")
 	out.add(" after_cancel")
 
 	assert.Equal(t, " main_finished sub_finished after_cancel", out.String())
@@ -119,12 +141,14 @@ func TestGracefulRunner(t *testing.T) {
 // Wait() returns only after the children have finished, also when the
 // handler returned first.
 func TestGracefulRunnerFinished(t *testing.T) {
+	s := newScenario(t)
 	out := &recorder{}
 	mainDone := make(chan struct{})
+	releaseChild := make(chan struct{})
 
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			if within(t, mainDone, "the handler to finish") {
+			if s.await(releaseChild) {
 				out.add(" sub_finished")
 			}
 		})
@@ -133,58 +157,111 @@ func TestGracefulRunnerFinished(t *testing.T) {
 		close(mainDone)
 	})
 
-	_, err := waitWithin(t, runner)
+	var err error
+	waited := make(chan struct{})
+	go func() {
+		_, err = runner.Wait()
+		close(waited)
+	}()
+
+	s.must(mainDone, "the handler to finish")
+	s.mustStillBlock(waited, "Wait()")
+
+	close(releaseChild)
+	s.must(waited, "Wait() to return")
+
 	assert.NoError(t, err)
 	assert.Equal(t, " main_finished sub_finished", out.String())
 }
 
-// A handler that fails cancels its children, and Wait() reports the error.
+// A handler that fails cancels its children, and Wait() reports the error
+// after the children have finished.
 func TestGracefulRunnerFail(t *testing.T) {
+	s := newScenario(t)
 	out := &recorder{}
 	mainDone := make(chan struct{})
+	childCancelled := make(chan struct{})
+	releaseChild := make(chan struct{})
 
 	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			if within(t, childCtx.Done(), "the child to be cancelled") && within(t, mainDone, "the handler to finish") {
+			if !s.await(childCtx.Done()) {
+				return
+			}
+			close(childCancelled)
+
+			if s.await(releaseChild) {
 				out.add(" sub_finished")
 			}
 		})
 
 		ctx.Fail(errors.New("simulated failure"))
-		if within(t, ctx.Done(), "the failed handler to be done") {
+		if s.await(ctx.Done()) {
 			out.add(" main_finished")
 		}
 		close(mainDone)
 	})
 
-	_, err := waitWithin(t, runner)
+	var err error
+	waited := make(chan struct{})
+	go func() {
+		_, err = runner.Wait()
+		close(waited)
+	}()
+
+	s.must(mainDone, "the failed handler to finish")
+	s.must(childCancelled, "the failure to cancel the child")
+	s.mustStillBlock(waited, "Wait()")
+
+	close(releaseChild)
+	s.must(waited, "Wait() to return")
+
 	assert.EqualError(t, err, "simulated failure")
 	assert.Equal(t, " main_finished sub_finished", out.String())
 }
 
-// A child that returns while its parent is being cancelled must not race
-// with that cancellation when its result is read. RunWithPerseverance
-// reads a child's result in exactly this way. The race detector reports
-// the unsynchronised read if the lock in Wait() is removed.
+// Wait() reads the runner's error under the lock that Fail() writes it
+// with. A parent that is cancelled cancels its children, also one whose
+// handler returns at that moment, and RunWithPerseverance reads a child's
+// result in exactly this way.
+//
+// This is a race-detector test: without -race it only checks that the
+// result is one of the two valid ones. It repeats the overlap many times,
+// because the detector reports a race only when it happens. With the lock
+// removed it fails within the first iterations.
 func TestGracefulChildWaitDuringParentCancel(t *testing.T) {
-	for i := 0; i < 200; i++ {
+	s := newScenario(t)
+
+	for i := 0; i < 1000; i++ {
 		ready := make(chan struct{})
 		release := make(chan struct{})
+		results := make(chan error, 1)
 
 		runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
 			child := ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-				within(t, release, "the child to be released")
+				s.await(release)
 			})
 
 			close(ready)
-			child.Wait()
+			_, err := child.Wait()
+			results <- err
 		})
 
-		if !within(t, ready, "the handler to start its child") {
-			t.FailNow()
-		}
+		s.must(ready, "the handler to start its child")
 
-		go close(release)
-		cancelWithin(t, runner)
+		cancelled := make(chan struct{})
+		go func() {
+			runner.Cancel()
+			close(cancelled)
+		}()
+		close(release)
+
+		s.must(cancelled, "Cancel() to return")
+
+		// The child either finished before the cancellation reached it,
+		// or it was cancelled. Nothing else is a valid result.
+		if err := <-results; err != nil {
+			assert.EqualError(t, err, "cancelled execution")
+		}
 	}
 }

@@ -1,6 +1,5 @@
 
-# The Go version follows go.mod (newest 1.24 patch release), like the CI.
-FROM --platform=$BUILDPLATFORM golang:1.24 AS build
+FROM --platform=$BUILDPLATFORM golang:1.24.0 AS build
 ADD cmd /app/cmd
 ADD pkg /app/pkg
 ADD go.mod /app/
