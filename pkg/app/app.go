@@ -93,8 +93,10 @@ func (app *App) Run(ctx utils.GracefulContext) {
 		})
 	}
 
+	babies := app.SessionStore.Snapshot().Babies
+
 	// Start reading the data from the stream
-	for _, babyInfo := range app.SessionStore.Session.Babies {
+	for _, babyInfo := range babies {
 		_babyInfo := babyInfo
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			app.handleBaby(_babyInfo, childCtx)
@@ -103,7 +105,7 @@ func (app *App) Run(ctx utils.GracefulContext) {
 
 	// Start serving content over HTTP
 	if app.Opts.HTTPEnabled {
-		go serve(app.SessionStore.Session.Babies, app.Opts.DataDirectories)
+		go serve(babies, app.Opts.DataDirectories)
 	}
 
 	<-ctx.Done()
@@ -265,7 +267,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 }
 
 func (app *App) getRemoteStreamURL(babyUID string) string {
-	return fmt.Sprintf("rtmps://media-secured.nanit.com/nanit/%v.%v", babyUID, app.SessionStore.Session.AuthToken)
+	return fmt.Sprintf("rtmps://media-secured.nanit.com/nanit/%v.%v", babyUID, app.SessionStore.Snapshot().AuthToken)
 }
 
 func (app *App) getLocalStreamURL(babyUID string) string {

@@ -36,7 +36,7 @@ type WebsocketConnectionManager struct {
 	BabyUID          string
 	CameraUID        string
 	Session          *session.Session
-	API              Authorizer
+	API              *NanitClient
 	BabyStateManager *baby.StateManager
 
 	mu               sync.RWMutex
@@ -45,7 +45,7 @@ type WebsocketConnectionManager struct {
 }
 
 // NewWebsocketConnectionManager - constructor
-func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *session.Session, api Authorizer, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
+func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *session.Session, api *NanitClient, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
 	manager := &WebsocketConnectionManager{
 		BabyUID:          babyUID,
 		CameraUID:        cameraUID,
@@ -121,7 +121,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 
 	// Remote
 	url := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%v/user_connect", manager.CameraUID)
-	auth := fmt.Sprintf("Bearer %v", manager.Session.AuthToken)
+	auth := fmt.Sprintf("Bearer %v", manager.API.AuthToken())
 
 	// Local
 	// url := "wss://192.168.3.195:442"

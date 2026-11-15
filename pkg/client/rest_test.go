@@ -3,10 +3,12 @@ package client
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,6 +27,14 @@ type fakeAPI struct {
 	refreshCalls  int32
 	lastRefresh   atomic.Value // refresh token of the last request
 
+	// rotate - behave like the real server: accept a refresh token once
+	// and answer with a new pair of tokens. A refresh token that was used
+	// before gets the answer 404.
+	rotate       bool
+	rotateMutex  sync.Mutex
+	validRefresh string
+	rotations    int
+
 	loginStatus int
 	loginBody   string
 	loginCalls  int32
@@ -32,8 +42,30 @@ type fakeAPI struct {
 	// babiesStatuses - status of each request for the baby list, in
 	// order. The last entry repeats.
 	babiesStatuses []int
+	babiesBody     string
 	babiesCalls    int32
 	babiesTokens   chan string // Authorization header of each request
+}
+
+// rotateTokens answers a renewal the way the real server does.
+func (api *fakeAPI) rotateTokens(w http.ResponseWriter, refreshToken string) {
+	// Let requests that were sent at the same moment arrive before the
+	// first of them is answered.
+	time.Sleep(20 * time.Millisecond)
+
+	api.rotateMutex.Lock()
+	defer api.rotateMutex.Unlock()
+
+	if refreshToken != api.validRefresh {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	api.rotations++
+	api.validRefresh = fmt.Sprintf("rotated-refresh-%d", api.rotations)
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"access_token":"rotated-access-%d","refresh_token":"%s"}`, api.rotations, api.validRefresh)
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -43,7 +75,10 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		loginStatus:   http.StatusCreated,
 		loginBody:     `{"access_token":"access-login","refresh_token":"refresh-login"}`,
 
+		validRefresh: "refresh-1",
+
 		babiesStatuses: []int{http.StatusOK},
+		babiesBody:     `{"babies":[{"uid":"baby-1","name":"Baby","camera_uid":"camera-1"}]}`,
 		babiesTokens:   make(chan string, 16),
 	}
 
@@ -54,6 +89,11 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		var body map[string]string
 		json.NewDecoder(r.Body).Decode(&body)
 		api.lastRefresh.Store(body["refresh_token"])
+
+		if api.rotate {
+			api.rotateTokens(w, body["refresh_token"])
+			return
+		}
 
 		w.WriteHeader(api.refreshStatus)
 		w.Write([]byte(api.refreshBody))
@@ -75,7 +115,7 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 
 		w.WriteHeader(status)
 		if status == http.StatusOK {
-			w.Write([]byte(`{"babies":[{"uid":"baby-1","name":"Baby","camera_uid":"camera-1"}]}`))
+			w.Write([]byte(api.babiesBody))
 		}
 	})
 
@@ -208,6 +248,90 @@ func TestMaybeAuthorizeKeepsAFreshToken(t *testing.T) {
 	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "force renews also a fresh token")
 }
 
+// A session without a refresh token starts with the one of the
+// configuration.
+func TestAuthorizeUsesTheConfiguredRefreshToken(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	c.SessionStore.Session.RefreshToken = ""
+	c.RefreshToken = "configured"
+
+	require.NoError(t, c.Authorize())
+
+	assert.Equal(t, "configured", api.lastRefresh.Load())
+	assert.Equal(t, "refresh-2", c.SessionStore.Session.RefreshToken)
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls))
+}
+
+// All cameras share one session, and the server accepts a refresh token
+// only once. Authorizations that are asked for at the same moment must
+// run one after the other, each with the refresh token that is valid
+// then. Without that, the second one is refused (404), falls through to a
+// login and ends the program.
+func TestAuthorizationsAtTheSameMomentDoNotShareARefreshToken(t *testing.T) {
+	api := newFakeAPI(t)
+	api.rotate = true
+	api.loginStatus = http.StatusUnauthorized
+	c := newTestClient(t, api)
+
+	const callers = 6
+	start := make(chan struct{})
+	results := make(chan error, callers)
+
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			results <- c.MaybeAuthorize(true)
+		}()
+	}
+
+	close(start)
+
+	for i := 0; i < callers; i++ {
+		assert.NoError(t, <-results)
+	}
+
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.loginCalls), "no renewal was refused")
+
+	api.rotateMutex.Lock()
+	defer api.rotateMutex.Unlock()
+	assert.GreaterOrEqual(t, api.rotations, 1)
+	assert.Equal(t, api.validRefresh, c.SessionStore.Snapshot().RefreshToken, "the session holds the refresh token that the server expects next")
+	assert.Equal(t, api.validRefresh, storedSession(t, c).RefreshToken, "and so does the session file")
+}
+
+// A caller that waited for its turn while another caller got a new token
+// uses that token. It does not ask for one more.
+func TestAuthorizationIsNotRepeatedForACallerThatWaited(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+
+	seen := c.authCount.Load() // a caller is about to wait for its turn
+
+	require.NoError(t, c.MaybeAuthorize(true)) // another caller is served first
+	require.NoError(t, c.authorizeAfter(seen))
+
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "the caller that waited did not renew again")
+
+	// A caller that comes later gets a renewal of its own
+	require.NoError(t, c.authorizeAfter(c.authCount.Load()))
+	assert.EqualValues(t, 2, atomic.LoadInt32(&api.refreshCalls))
+}
+
+// An answer that is JSON, but not of the expected form, means that the
+// API has changed. Asking again does not help.
+func TestAuthResponseOfAnUnexpectedFormIsPermanent(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.refreshBody = `{"access_token":{"value":"access-2"}}`
+
+	err := c.RenewSession()
+
+	require.Error(t, err)
+	assert.False(t, IsTemporary(err), "got: %v", err)
+	assert.Equal(t, "access-1", c.SessionStore.Session.AuthToken, "the session keeps its tokens")
+}
+
 // An answer that reports success but carries no access token is not
 // tried again: that would send the credentials again and again. A new
 // refresh token in it is kept, because the server may already have retired
@@ -263,6 +387,32 @@ func TestFetchAuthorizedGivesUpAfterTwoRefusals(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, IsTemporary(err))
 	assert.EqualValues(t, 2, atomic.LoadInt32(&api.babiesCalls))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "no renewal follows the second refusal, because no request would use it")
+}
+
+// What the answer of a request can look like when the status says
+// success, and what each case means for the caller.
+func TestFetchAuthorizedSortsAnswersItCannotUse(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body      string
+		temporary bool
+	}{
+		"not JSON, something else answered": {`<html>Sign in to the network</html>`, true},
+		"cut off":                           {`{"babies":[{"uid":"baby-1"`, true},
+		"empty":                             {``, true},
+		"JSON of another form":              {`{"babies":"none"}`, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI(t)
+			c := newTestClient(t, api)
+			api.babiesBody = tc.body
+
+			_, err := c.FetchBabies()
+
+			require.Error(t, err)
+			assert.Equal(t, tc.temporary, IsTemporary(err), "got: %v", err)
+		})
+	}
 }
 
 // The program used to end on every failed request for the baby list or
@@ -366,32 +516,62 @@ func TestRetryTemporaryStopsWhileWaiting(t *testing.T) {
 	}
 }
 
-// A call that hangs, like a request to a network that drops packets, must
-// not hold up a shutdown.
-func TestRetryTemporaryStopsDuringACall(t *testing.T) {
+// A call that is running is not abandoned: a renewal that nobody waits
+// for could lose the new refresh token. The helper returns when the call
+// has ended.
+func TestRetryTemporaryWaitsForARunningCall(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	defer close(release)
 
 	fn := func() error {
 		close(started)
 		<-release
-		return nil
+		return temporary("no network")
 	}
 
 	done := make(chan struct{})
 	result := make(chan error, 1)
-	go func() { result <- RetryTemporary(done, nil, "test", fn) }()
+	go func() { result <- RetryTemporary(done, []time.Duration{time.Hour}, "test", fn) }()
 
 	<-started
 	close(done)
 
 	select {
 	case err := <-result:
+		t.Fatalf("RetryTemporary returned (%v) while the call was still running", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-result:
 		assert.True(t, errors.Is(err, ErrRetryCancelled), "got: %v", err)
 	case <-time.After(5 * time.Second):
-		t.Fatal("RetryTemporary waited for the hanging call")
+		t.Fatal("RetryTemporary did not return after the call had ended")
 	}
+}
+
+// A call that succeeds counts, also when done has closed in the meantime.
+func TestRetryTemporaryKeepsASuccessAfterDone(t *testing.T) {
+	done := make(chan struct{})
+	fn := func() error {
+		close(done)
+		return nil
+	}
+
+	assert.NoError(t, RetryTemporary(done, nil, "test", fn))
+}
+
+func TestRetryTemporaryDoesNotCallWhenDoneHasClosed(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+
+	calls := 0
+	err := RetryTemporary(done, nil, "test", scripted(&calls, nil))
+
+	assert.True(t, errors.Is(err, ErrRetryCancelled), "got: %v", err)
+	assert.Equal(t, 0, calls)
 }
 
 // Without a list of waits there is a default pause, not a panic.
