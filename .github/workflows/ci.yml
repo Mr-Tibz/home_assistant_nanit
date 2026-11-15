@@ -29,9 +29,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build
-        run: go build ./...
-
+      # Vet and the tests compile every package, test files included.
       - name: Vet
         run: go vet ./...
 

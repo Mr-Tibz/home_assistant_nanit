@@ -113,62 +113,80 @@ func wait(runner utils.GracefulRunner) (<-chan struct{}, *waitResult) {
 // A cancelled runner waits for its handler and for the children of that
 // handler, whichever of them finishes last.
 func TestGracefulRunner(t *testing.T) {
-	s := newScenario(t)
-	started := make(chan struct{})
-	handlerCancelled := make(chan struct{})
-	releaseHandler := make(chan struct{})
-	handlerFinished := make(chan struct{})
-	childCancelled := make(chan struct{})
-	releaseChild := make(chan struct{})
-	childFinished := make(chan struct{})
+	for _, tc := range []struct {
+		name        string
+		handlerLast bool
+	}{
+		{"child finishes before the handler", true},
+		{"child outlives the handler", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newScenario(t)
+			started := make(chan struct{})
+			handlerCancelled := make(chan struct{})
+			releaseHandler := make(chan struct{})
+			handlerFinished := make(chan struct{})
+			childCancelled := make(chan struct{})
+			releaseChild := make(chan struct{})
+			childFinished := make(chan struct{})
 
-	runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
-		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			if !s.await(childCtx.Done()) {
-				return
-			}
-			close(childCancelled)
+			runner := utils.RunWithGracefulCancel(func(ctx utils.GracefulContext) {
+				ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+					if !s.await(childCtx.Done()) {
+						return
+					}
+					close(childCancelled)
 
-			if s.await(releaseChild) {
-				close(childFinished)
+					if s.await(releaseChild) {
+						close(childFinished)
+					}
+				})
+
+				close(started)
+				if !s.await(ctx.Done()) {
+					return
+				}
+				close(handlerCancelled)
+
+				if s.await(releaseHandler) {
+					close(handlerFinished)
+				}
+			})
+
+			s.must(started, "the handler to start")
+
+			cancelReturned := make(chan struct{})
+			go func() {
+				runner.Cancel()
+				close(cancelReturned)
+			}()
+
+			s.must(handlerCancelled, "the cancellation to reach the handler")
+			s.must(childCancelled, "the cancellation to reach the child")
+			s.mustStillBlock(cancelReturned, "Cancel() returned while the handler and the child were still working")
+
+			if tc.handlerLast {
+				close(releaseChild)
+				s.must(childFinished, "the child to finish")
+				s.mustStillBlock(cancelReturned, "Cancel() returned while the handler was still working")
+				close(releaseHandler)
+			} else {
+				close(releaseHandler)
+				s.must(handlerFinished, "the handler to finish")
+				s.mustStillBlock(cancelReturned, "Cancel() returned while the child was still working")
+				close(releaseChild)
 			}
+
+			s.must(cancelReturned, "Cancel() to return")
+			s.mustAlready(handlerFinished, "Cancel() returned although the handler had not finished")
+			s.mustAlready(childFinished, "Cancel() returned although the child had not finished")
+
+			done, res := wait(runner)
+			s.must(done, "Wait() to return")
+			assert.True(t, res.cancelled)
+			assert.Error(t, res.err)
 		})
-
-		close(started)
-		if !s.await(ctx.Done()) {
-			return
-		}
-		close(handlerCancelled)
-
-		if s.await(releaseHandler) {
-			close(handlerFinished)
-		}
-	})
-
-	s.must(started, "the handler to start")
-
-	cancelReturned := make(chan struct{})
-	go func() {
-		runner.Cancel()
-		close(cancelReturned)
-	}()
-
-	s.must(handlerCancelled, "the cancellation to reach the handler")
-	s.must(childCancelled, "the cancellation to reach the child")
-	s.mustStillBlock(cancelReturned, "Cancel() returned while the handler and the child were still working")
-
-	close(releaseChild)
-	s.must(childFinished, "the child to finish")
-	s.mustStillBlock(cancelReturned, "Cancel() returned while the handler was still working")
-
-	close(releaseHandler)
-	s.must(cancelReturned, "Cancel() to return")
-	s.mustAlready(handlerFinished, "Cancel() returned although the handler had not finished")
-
-	done, res := wait(runner)
-	s.must(done, "Wait() to return")
-	assert.True(t, res.cancelled)
-	assert.Error(t, res.err)
+	}
 }
 
 // Wait() returns only after the children have finished, also when the
@@ -261,15 +279,12 @@ func TestGracefulRunnerFail(t *testing.T) {
 // child whose handler returns at the same moment. RunWithPerseverance
 // reads a child's result in exactly this way.
 //
-// Only the race detector can see this defect, so the test is skipped
-// without it. The detector reports a race only when it happens, so the
-// overlap is repeated many times. With the lock in Wait() removed, it is
-// reported within the first iterations.
+// Only the race detector can see an unsynchronised read, and it reports a
+// race only when it happens, so the overlap is repeated many times. With
+// the lock in Wait() removed, "go test -race" reports it within the first
+// iterations. Without the race detector the test still checks that every
+// Cancel() returns and that every handler delivers its result.
 func TestGracefulChildWaitDuringParentCancel(t *testing.T) {
-	if !raceDetectorEnabled {
-		t.Skip("needs the race detector (go test -race)")
-	}
-
 	s := newScenario(t)
 	finishedFirst, cancelledFirst := 0, 0
 
@@ -300,12 +315,24 @@ func TestGracefulChildWaitDuringParentCancel(t *testing.T) {
 
 		s.must(cancelReturned, "Cancel() to return")
 
-		if <-results {
-			cancelledFirst++
-		} else {
-			finishedFirst++
+		select {
+		case cancelled := <-results:
+			if cancelled {
+				cancelledFirst++
+			} else {
+				finishedFirst++
+			}
+		case <-time.After(testTimeout):
+			t.Fatal("timed out waiting for the handler to deliver its child's result")
 		}
 	}
 
 	t.Logf("child returned first: %d times, cancellation reached it first: %d times", finishedFirst, cancelledFirst)
+
+	// The read in Wait() can only overlap with a write when the
+	// cancellation reaches the child. If that never happened, this run
+	// has not exercised what the test is for.
+	if cancelledFirst == 0 {
+		t.Skip("the cancellation never reached a child before it returned, so nothing was exercised")
+	}
 }
