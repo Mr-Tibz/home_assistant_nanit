@@ -9,7 +9,6 @@ import (
 	"github.com/rs/zerolog/log"
 	"github.com/sacOO7/gowebsocket"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
-	"github.com/indiefan/home_assistant_nanit/pkg/session"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 	"google.golang.org/protobuf/proto"
 )
@@ -19,6 +18,15 @@ type readyState struct {
 	Connection *WebsocketConnection
 }
 
+// authorizeWaits - pauses between tries to authorize before a websocket
+// attempt, when the failure can pass by itself
+var authorizeWaits = []time.Duration{
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	30 * time.Second,
+}
+
 // WebsocketConnectionHandler - handler of ready connection
 type WebsocketConnectionHandler func(*WebsocketConnection, utils.GracefulContext)
 
@@ -26,7 +34,6 @@ type WebsocketConnectionHandler func(*WebsocketConnection, utils.GracefulContext
 type WebsocketConnectionManager struct {
 	BabyUID          string
 	CameraUID        string
-	Session          *session.Session
 	API              *NanitClient
 	BabyStateManager *baby.StateManager
 
@@ -36,11 +43,10 @@ type WebsocketConnectionManager struct {
 }
 
 // NewWebsocketConnectionManager - constructor
-func NewWebsocketConnectionManager(babyUID string, cameraUID string, session *session.Session, api *NanitClient, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
+func NewWebsocketConnectionManager(babyUID string, cameraUID string, api *NanitClient, babyStateManager *baby.StateManager) *WebsocketConnectionManager {
 	manager := &WebsocketConnectionManager{
 		BabyUID:          babyUID,
 		CameraUID:        cameraUID,
-		Session:          session,
 		API:              api,
 		BabyStateManager: babyStateManager,
 	}
@@ -93,12 +99,33 @@ func (manager *WebsocketConnectionManager) RunWithinContext(ctx utils.GracefulCo
 }
 
 func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
-	// Reauthorize if it is not a first try or we assume we don't have a valid token
-	manager.API.MaybeAuthorize(attempt.GetTry() > 1)
+	// Reauthorize if it is not a first try or we assume we don't have a valid token.
+	//
+	// A failure that can pass (no network, a timeout, a server error) is
+	// tried again here, with short pauses. It does not fail the attempt:
+	// the cooldown between failed attempts grows to an hour, and that
+	// would keep the stream down long after the network has come back.
+	//
+	// The time spent here counts as run time of the attempt. If the
+	// attempt fails after such a wait, RunWithPerseverance starts the
+	// next one at once and as a first try (see ResetThreshold).
+	force := attempt.GetTry() > 1
+	err := RetryTemporary(attempt.Done(), authorizeWaits, "authorize", func() error {
+		return manager.API.AuthorizeForAttempt(force)
+	})
+	if errors.Is(err, ErrRetryCancelled) {
+		return
+	}
+	if err != nil {
+		log.Fatal().Err(err).Msg("Unable to authorize")
+	}
 
 	// Remote
 	url := fmt.Sprintf("wss://api.nanit.com/focus/cameras/%v/user_connect", manager.CameraUID)
-	auth := fmt.Sprintf("Bearer %v", manager.Session.AuthToken)
+	// Like a request, the attempt waits for an authorization that is
+	// running and takes the token that it gives.
+	token, _ := manager.API.tokenForRequest()
+	auth := fmt.Sprintf("Bearer %v", token)
 
 	// Local
 	// url := "wss://192.168.3.195:442"

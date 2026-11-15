@@ -2,12 +2,17 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
+	"github.com/rs/zerolog/log"
 )
 
 // Revision - marks the version of the structure of a session file. Only files with equal revision will be loaded
@@ -25,15 +30,30 @@ type Session struct {
 }
 
 // Store - application session store context
+//
+// Several goroutines use the session during the run: every camera renews
+// the token, and the message poll records what it has seen. Snapshot
+// reads the session, and Update changes it and stores it in the file.
 type Store struct {
 	Filename string
-	Session  *Session
+
+	// mu guards session. It is held only for a moment, never during a
+	// write to the disk, so reading the session does not wait for a save.
+	mu      sync.Mutex
+	session *Session
+
+	// fileMu lets one save run at a time, and guards inPlace
+	fileMu sync.Mutex
+
+	// inPlace - the session file cannot be replaced by a rename here, so
+	// every save rewrites it in place
+	inPlace bool
 }
 
 // NewSessionStore - constructor
 func NewSessionStore() *Store {
 	return &Store{
-		Session: &Session{Revision: Revision},
+		session: &Session{Revision: Revision},
 	}
 }
 
@@ -58,7 +78,9 @@ func (store *Store) Load() {
 	}
 
 	if session.Revision == Revision {
-		store.Session = session
+		store.mu.Lock()
+		store.session = session
+		store.mu.Unlock()
 		log.Info().Str("filename", store.Filename).Msg("Loaded app session from the file")
 	} else {
 		log.Warn().Str("filename", store.Filename).Msg("App session file contains older revision of the state, ignoring")
@@ -66,29 +88,339 @@ func (store *Store) Load() {
 
 }
 
-// Save - stores current data in a file
-func (store *Store) Save() {
+// Snapshot returns a copy of the session as it is now.
+func (store *Store) Snapshot() Session {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	return *store.session
+}
+
+// Update changes the session with change and stores it in the file.
+//
+// The data goes to a temporary file that then replaces the session file
+// in one step. The session file is therefore always complete: a crash or
+// a kill in the middle of a save cannot destroy the refresh token, which
+// would force a new login.
+//
+// A failed save is logged here and returned. It does not end the program:
+// the session is still valid in memory, and ending the program would only
+// lose the tokens that have just been received.
+func (store *Store) Update(change func(session *Session)) error {
+	store.mu.Lock()
+	change(store.session)
+	store.mu.Unlock()
+
+	return store.save()
+}
+
+// save stores the session in the file.
+//
+// One save runs at a time, and each save writes the session as it is when
+// its turn comes. The file therefore never goes back to an older state,
+// whatever the order in which the saves get their turn.
+func (store *Store) save() error {
 	if store.Filename == "" {
-		return
+		return nil
 	}
+
+	store.fileMu.Lock()
+	defer store.fileMu.Unlock()
 
 	log.Trace().Str("filename", store.Filename).Msg("Storing app session to the file")
 
-	f, err := os.OpenFile(store.Filename, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatal().Str("filename", store.Filename).Err(err).Msg("Unable to open app session file for writing")
-	}
-
-	defer f.Close()
-
-	data, jsonErr := json.Marshal(store.Session)
+	data, jsonErr := store.marshal()
 	if jsonErr != nil {
 		log.Fatal().Str("filename", store.Filename).Err(jsonErr).Msg("Unable to marshal contents of app session file")
 	}
 
-	_, writeErr := f.Write(data)
-	if writeErr != nil {
-		log.Fatal().Str("filename", store.Filename).Err(writeErr).Msg("Unable to wrote to app session file")
+	if err := store.write(data); err != nil {
+		log.Error().Str("filename", store.Filename).Err(err).Msg("Unable to store app session file. The session continues in memory, but the next start may need a new login")
+		return err
+	}
+
+	return nil
+}
+
+func (store *Store) marshal() ([]byte, error) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	return json.Marshal(store.session)
+}
+
+// write puts data in the session file. The caller holds store.fileMu.
+//
+// It replaces the file in one step (see replaceFile). In two cases it
+// rewrites the file in place when that is not possible:
+//
+//   - The cause lies in the place of the file (see placeRefuses). It
+//     does not pass, so the file is rewritten in place, now and at every
+//     following save.
+//   - The disk is full, and the new content fits in the space that the
+//     file already has. On a file system that overwrites in place, the
+//     rewrite then needs no new space, so it works and cannot stop
+//     half-way for the lack of space. On a file system that writes
+//     every change to a new place, it fails and leaves the file as it
+//     is. Not trying would be worse: the server may have replaced the
+//     refresh token already. The next save tries to replace the file
+//     again.
+//
+// After every other failure, such as a read or write error of the disk,
+// the file is left as it is and the failure is returned.
+func (store *Store) write(data []byte) error {
+	if !store.inPlace {
+		err := replaceFile(store.Filename, data)
+
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, errLinkWithoutFile):
+			// Opening the link for writing creates the file
+		case placeRefuses(err):
+			// Do not go through a temporary file again at every save: it
+			// would hold the tokens each time and help nothing.
+			store.inPlace = true
+			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file cannot be replaced in one step in this place. It is rewritten in place until the program ends, and a crash in the middle of a save can damage it")
+		case diskFull(err) && fitsInPlace(store.Filename, data):
+			log.Warn().Str("filename", store.Filename).Err(err).Msg("The app session file could not be replaced in one step. It is rewritten in place for this save")
+		default:
+			return err
+		}
+	}
+
+	return writeFileInPlace(store.Filename, data)
+}
+
+// diskFull reports whether err says that there is no space left for this
+// user on the file system.
+func diskFull(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}
+
+// fitsInPlace reports whether filename exists and has room for data in
+// the space it already takes on the disk. Rewriting it in place then
+// needs no new space.
+func fitsInPlace(filename string, data []byte) bool {
+	info, err := os.Stat(filename)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+
+	room := info.Size()
+	if allocated := allocatedSize(info); allocated > room {
+		room = allocated
+	}
+
+	return int64(len(data)) <= room
+}
+
+// checkWritable finds out whether the session can be saved at all. A
+// file that exists is only opened for writing, which is what the rewrite
+// in place needs. Its content is not touched: writing it back would undo
+// a change that the setup script makes at the same moment. A file that
+// does not exist yet is created, with the session as it is now.
+func (store *Store) checkWritable() error {
+	store.fileMu.Lock()
+	defer store.fileMu.Unlock()
+
+	f, err := os.OpenFile(store.Filename, os.O_WRONLY, 0)
+	if err == nil {
+		return f.Close()
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	data, err := store.marshal()
+	if err != nil {
+		return err
+	}
+
+	return store.write(data)
+}
+
+// newSessionFileMode - mode of a session file that this program creates.
+// The file holds tokens that give full access to the account, so only its
+// owner may read it. A file that already exists keeps its mode and owner.
+const newSessionFileMode os.FileMode = 0600
+
+// tempFileMark - what follows the name of the session file in the name of
+// its temporary files. A number follows the mark.
+const tempFileMark = ".tmp-"
+
+// errLinkWithoutFile - the session file is a symbolic link to a file that
+// does not exist yet. A rename would put a regular file in the place of
+// the link.
+var errLinkWithoutFile = errors.New("the session file is a link to a file that does not exist yet")
+
+// placeRefuses reports whether err says that the place of the session
+// file does not allow what replaceFile does there. These causes do not
+// pass by themselves. Every other failure, such as a full disk or too
+// many open files, can pass.
+func placeRefuses(err error) bool {
+	return errors.Is(err, fs.ErrPermission) || // the directory, or the mode or owner of the file, is not ours to change
+		errors.Is(err, syscall.EROFS) || // the directory is on a read-only file system
+		errors.Is(err, syscall.EBUSY) || // the file itself is mounted, for example into a container
+		errors.Is(err, syscall.EXDEV) || // the file is on another file system than its directory
+		errors.Is(err, syscall.ENAMETOOLONG) || // the name leaves no room for the name of a temporary file
+		errors.Is(err, errors.ErrUnsupported)
+}
+
+// createTemp - os.CreateTemp, which a test replaces to make it fail
+var createTemp = os.CreateTemp
+
+// replaceFile replaces the content of filename in one step: it writes
+// data to a temporary file in the same directory and renames that file
+// over filename. The file that exists is not touched before the rename.
+//
+// If filename is a symbolic link, the file it points to is replaced and
+// the link stays. A file that exists keeps its mode and its owner.
+//
+// The rename is not possible everywhere, for example when the file itself
+// is mounted into a container.
+func replaceFile(filename string, data []byte) error {
+	target, err := filepath.EvalSymlinks(filename)
+	if err != nil {
+		if isSymlink(filename) {
+			return errLinkWithoutFile
+		}
+
+		target = filename
+	}
+
+	existing, statErr := os.Stat(target)
+	exists := statErr == nil
+
+	dir := filepath.Dir(target)
+
+	// os.CreateTemp creates the file with mode 0600
+	tmp, err := createTemp(dir, filepath.Base(target)+tempFileMark+"*")
+	if err != nil {
+		return err
+	}
+
+	tmpName := tmp.Name()
+	discard := func(err error) error {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+
+	if exists {
+		if err := tmp.Chmod(existing.Mode().Perm()); err != nil {
+			return discard(err)
+		}
+		if err := keepOwner(tmp, existing); err != nil {
+			return discard(err)
+		}
+	}
+
+	if _, err := tmp.Write(data); err != nil {
+		return discard(err)
+	}
+	if err := tmp.Sync(); err != nil && !syncUnsupported(err) {
+		return discard(err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+
+	if err := os.Rename(tmpName, target); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+
+	// Make the rename itself durable. Not every file system supports
+	// syncing a directory, and the data is already in place, so a failure
+	// here is not reported.
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+
+	return nil
+}
+
+// writeFileInPlace replaces the content of filename without a temporary
+// file. It writes the new content first and cuts the file to the new
+// length afterwards, so the file is never empty in between.
+func writeFileInPlace(filename string, data []byte) error {
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, newSessionFileMode)
+	if err != nil {
+		return err
+	}
+
+	if _, err := f.WriteAt(data, 0); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Truncate(int64(len(data))); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil && !syncUnsupported(err) {
+		f.Close()
+		return err
+	}
+
+	return f.Close()
+}
+
+// syncUnsupported reports whether err says that the file system cannot
+// flush a file to the disk at all. Some network and virtual file systems
+// cannot. That is not a failed write.
+func syncUnsupported(err error) bool {
+	return errors.Is(err, errors.ErrUnsupported) || errors.Is(err, syscall.EINVAL)
+}
+
+func isSymlink(filename string) bool {
+	info, err := os.Lstat(filename)
+	return err == nil && info.Mode()&os.ModeSymlink != 0
+}
+
+// isTempFileName reports whether name is the name of a temporary file of
+// the session file sessionName: that name, the mark, and a number.
+func isTempFileName(name string, sessionName string) bool {
+	number, found := strings.CutPrefix(name, sessionName+tempFileMark)
+	if !found || number == "" {
+		return false
+	}
+
+	for _, char := range number {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+
+	return true
+}
+
+// removeStaleTempFiles deletes temporary files that an earlier run left
+// behind when it was ended in the middle of a save. They hold tokens.
+func removeStaleTempFiles(filename string) {
+	target := filename
+	if resolved, err := filepath.EvalSymlinks(filename); err == nil {
+		target = resolved
+	}
+
+	dir := filepath.Dir(target)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() || !isTempFileName(entry.Name(), filepath.Base(target)) {
+			continue
+		}
+
+		name := filepath.Join(dir, entry.Name())
+		if err := os.Remove(name); err == nil {
+			log.Debug().Str("filename", name).Msg("Removed a temporary session file of an earlier run")
+		}
 	}
 }
 
@@ -105,7 +437,16 @@ func InitSessionStore(sessionFile string) *Store {
 		}
 
 		sessionStore.Filename = absFileName
+		removeStaleTempFiles(absFileName)
 		sessionStore.Load()
+
+		// The server replaces the refresh token during the run, and the
+		// new one must reach the file. If it cannot, say so now. Later
+		// would be at the next start, when the token in the file is no
+		// longer valid and a new login by hand is needed.
+		if err := sessionStore.checkWritable(); err != nil {
+			log.Fatal().Str("filename", absFileName).Err(err).Msg("The app session file cannot be written")
+		}
 	}
 
 	return sessionStore

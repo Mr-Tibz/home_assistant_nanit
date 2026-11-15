@@ -86,4 +86,9 @@ if [ "$DEBUG" = true ] ; then
     echo "SESSION_JSON Result: $SESSION_JSON"
 fi
 
+# The file holds tokens that give full access to the account, so a new
+# file is created readable by its owner only. A file that exists keeps its
+# mode, as it does when the program saves it.
+umask 077
+
 echo "$SESSION_JSON" > /data/session.json

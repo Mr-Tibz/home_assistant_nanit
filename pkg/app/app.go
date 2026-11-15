@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,7 +13,18 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/rtmpserver"
 	"github.com/indiefan/home_assistant_nanit/pkg/session"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
+	"github.com/rs/zerolog/log"
 )
+
+// startupWaits - pauses between tries of a start-up step that failed for a
+// reason that can pass by itself
+var startupWaits = []time.Duration{
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
+	40 * time.Second,
+	60 * time.Second,
+}
 
 // App - application container
 type App struct {
@@ -48,11 +60,26 @@ func NewApp(opts Opts) *App {
 
 // Run - application main loop
 func (app *App) Run(ctx utils.GracefulContext) {
-	// Reauthorize if we don't have a token or we assume it is invalid
-	app.RestClient.MaybeAuthorize(false)
+	// Reauthorize if we don't have a token or we assume it is invalid,
+	// and fetch babies info if they are not present in session.
+	//
+	// The authorization comes first, as before: a session that the setup
+	// script has made holds no auth token that a request could use.
+	//
+	// A failure that can pass, like no network yet after a boot, is tried
+	// again. Any other failure ends the program.
+	if !retryAtStart(ctx, "authorize", func() error { return app.RestClient.MaybeAuthorize(false) }) {
+		return
+	}
 
-	// Fetches babies info if they are not present in session
-	app.RestClient.EnsureBabies()
+	var babies []baby.Baby
+
+	if !retryAtStart(ctx, "fetch the baby list", func() (err error) {
+		babies, err = app.RestClient.EnsureBabies()
+		return err
+	}) {
+		return
+	}
 
 	// RTMP
 	if app.Opts.RTMP != nil {
@@ -67,7 +94,7 @@ func (app *App) Run(ctx utils.GracefulContext) {
 	}
 
 	// Start reading the data from the stream
-	for _, babyInfo := range app.SessionStore.Session.Babies {
+	for _, babyInfo := range babies {
 		_babyInfo := babyInfo
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			app.handleBaby(_babyInfo, childCtx)
@@ -76,16 +103,32 @@ func (app *App) Run(ctx utils.GracefulContext) {
 
 	// Start serving content over HTTP
 	if app.Opts.HTTPEnabled {
-		go serve(app.SessionStore.Session.Babies, app.Opts.DataDirectories)
+		go serve(babies, app.Opts.DataDirectories)
 	}
 
 	<-ctx.Done()
 }
 
+// retryAtStart runs a step of the start until it succeeds. It tries
+// again after a failure that can pass, and ends the program after any
+// other failure. It returns false when the program is told to stop
+// first.
+func retryAtStart(ctx utils.GracefulContext, what string, step func() error) bool {
+	err := client.RetryTemporary(ctx.Done(), startupWaits, what, step)
+	if errors.Is(err, client.ErrRetryCancelled) {
+		return false
+	}
+	if err != nil {
+		log.Fatal().Err(err).Msgf("Unable to %v", what)
+	}
+
+	return true
+}
+
 func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 	if app.Opts.RTMP != nil || app.MQTTConnection != nil {
 		// Websocket connection
-		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.SessionStore.Session, app.RestClient, app.BabyStateManager)
+		ws := client.NewWebsocketConnectionManager(baby.UID, baby.CameraUID, app.RestClient, app.BabyStateManager)
 
 		ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
 			app.runWebsocket(baby.UID, conn, childCtx)
@@ -104,22 +147,32 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 }
 
 func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager) {
-	newMessages := app.RestClient.FetchNewMessages(babyUID, app.Opts.EventPolling.MessageTimeout)
+	// A loop, and not a call of itself at the end of each round: that
+	// call added a frame to the stack of the goroutine at every round,
+	// for as long as the program ran.
+	for {
+		newMessages, err := app.RestClient.FetchNewMessages(babyUID, app.Opts.EventPolling.MessageTimeout)
+		if err != nil {
+			if !client.IsTemporary(err) {
+				log.Fatal().Err(err).Msg("Unable to fetch messages")
+			}
 
-	for _, msg := range newMessages {
-		switch msg.Type {
-		case message.SoundEventMessageType:
-			go babyStateManager.NotifySoundSubscribers(babyUID, time.Time(msg.Time))
-			break
-		case message.MotionEventMessageType:
-			go babyStateManager.NotifyMotionSubscribers(babyUID, time.Time(msg.Time))
-			break
+			// Skip this round. The next one comes after the polling interval.
+			log.Warn().Err(err).Msg("Unable to fetch messages, will try again")
 		}
-	}
 
-	// wait for the specified interval
-	time.Sleep(app.Opts.EventPolling.PollingInterval)
-	app.pollMessages(babyUID, babyStateManager)
+		for _, msg := range newMessages {
+			switch msg.Type {
+			case message.SoundEventMessageType:
+				go babyStateManager.NotifySoundSubscribers(babyUID, time.Time(msg.Time))
+			case message.MotionEventMessageType:
+				go babyStateManager.NotifyMotionSubscribers(babyUID, time.Time(msg.Time))
+			}
+		}
+
+		// wait for the specified interval
+		time.Sleep(app.Opts.EventPolling.PollingInterval)
+	}
 }
 
 func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
@@ -230,7 +283,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 }
 
 func (app *App) getRemoteStreamURL(babyUID string) string {
-	return fmt.Sprintf("rtmps://media-secured.nanit.com/nanit/%v.%v", babyUID, app.SessionStore.Session.AuthToken)
+	return fmt.Sprintf("rtmps://media-secured.nanit.com/nanit/%v.%v", babyUID, app.SessionStore.Snapshot().AuthToken)
 }
 
 func (app *App) getLocalStreamURL(babyUID string) string {
