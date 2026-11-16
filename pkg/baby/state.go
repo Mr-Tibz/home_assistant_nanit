@@ -8,14 +8,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-type StreamRequestState int32
-
-const (
-	StreamRequestState_NotRequested StreamRequestState = iota
-	StreamRequestState_Requested
-	StreamRequestState_RequestFailed
-)
-
 type StreamState int32
 
 const (
@@ -26,9 +18,8 @@ const (
 
 // State - struct holding information about state of a single baby
 type State struct {
-	StreamState        *StreamState        `internal:"true"`
-	StreamRequestState *StreamRequestState `internal:"true"`
-	IsWebsocketAlive   *bool               `internal:"true"`
+	StreamState      *StreamState `internal:"true"`
+	IsWebsocketAlive *bool        `internal:"true"`
 
 	MotionTimestamp  *int32 // int32 is used to represent UTC timestamp
 	SoundTimestamp   *int32 // int32 is used to represent UTC timestamp
@@ -161,21 +152,6 @@ func (state *State) GetHumidity() float64 {
 	return 0
 }
 
-// SetStreamRequestState - mutates field, returns itself
-func (state *State) SetStreamRequestState(value StreamRequestState) *State {
-	state.StreamRequestState = &value
-	return state
-}
-
-// GetStreamRequestState - safely returns value
-func (state *State) GetStreamRequestState() StreamRequestState {
-	if state.StreamRequestState != nil {
-		return *state.StreamRequestState
-	}
-
-	return StreamRequestState_NotRequested
-}
-
 // SetStreamState - mutates field, returns itself
 func (state *State) SetStreamState(value StreamState) *State {
 	state.StreamState = &value
@@ -210,15 +186,6 @@ func (state *State) SetSoundTimestamp(value int32) *State {
 func (state *State) SetTemperature(value bool) *State {
 	state.Temperature = &value
 	return state
-}
-
-// GetIsWebsocketAlive - safely returns value
-func (state *State) GetIsWebsocketAlive() bool {
-	if state.StreamState != nil {
-		return *state.IsWebsocketAlive
-	}
-
-	return false
 }
 
 // SetWebsocketAlive - mutates field, returns itself

@@ -190,8 +190,6 @@ func setTokenAge(c *NanitClient, age time.Duration) {
 }
 
 // websocketAlive reads what the manager has reported about the connection.
-// It reads the field itself: State.GetIsWebsocketAlive looks at another
-// field (a defect that the change of the stream handling corrects).
 func websocketAlive(manager *WebsocketConnectionManager) bool {
 	alive := manager.BabyStateManager.GetBabyState(manager.BabyUID).IsWebsocketAlive
 	return alive != nil && *alive

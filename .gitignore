@@ -2,3 +2,7 @@
 data
 .DS_Store
 docker-compose.yml
+
+# Build output
+/nanit
+/nanit.exe

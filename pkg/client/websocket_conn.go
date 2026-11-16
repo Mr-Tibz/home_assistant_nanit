@@ -46,6 +46,10 @@ type WebsocketConnection struct {
 	closeOnce sync.Once
 	closeErr  error
 
+	// idleLimitApplies - there is an idle limit, and the other end has
+	// answered a ping
+	idleLimitApplies atomic.Bool
+
 	msgHandlersMu sync.RWMutex
 	msgHandlers   []WebsocketMessageHandler
 
@@ -107,6 +111,19 @@ func (conn *WebsocketConnection) endAfterFailedWrite(writeErr error) {
 			conn.end(fmt.Errorf("unable to send a message: %w", writeErr))
 		}
 	}()
+}
+
+// GiveUp ends the connection, for a user of the connection that has seen
+// that it does not work. The manager then makes a new one.
+func (conn *WebsocketConnection) GiveUp(reason error) {
+	conn.end(reason)
+}
+
+// IdleLimitApplies reports whether the idle limit applies to this
+// connection: there is one, and the other end has answered a ping. Such
+// a connection is given up when it stops carrying data.
+func (conn *WebsocketConnection) IdleLimitApplies() bool {
+	return conn.idleLimitApplies.Load()
 }
 
 // endReason returns why the connection has ended. Call it after Done.
@@ -302,16 +319,16 @@ func (conn *WebsocketConnection) handleMessage(m *Message) {
 // camera can be quiet for longer than the limit: without this, such a
 // connection would be ended and made again without end.
 func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
-	pingsAnswered := false
-
 	extend := func() {
-		if idleTimeout > 0 && pingsAnswered {
+		if conn.idleLimitApplies.Load() {
 			conn.socket.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 	}
 
 	conn.socket.SetPongHandler(func(string) error {
-		pingsAnswered = true
+		if idleTimeout > 0 {
+			conn.idleLimitApplies.Store(true)
+		}
 		extend()
 		return nil
 	})

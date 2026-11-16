@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"os/signal"
+	"syscall"
 	"regexp"
 	"time"
 
@@ -44,6 +45,15 @@ func websocketOpts() app.WebsocketOpts {
 
 	return opts
 }
+
+// defaultShutdownTimeout - time that the clean up gets after a signal to
+// stop. A container is killed 10 seconds after it was told to stop,
+// unless it is set up otherwise, so the program must be gone before that.
+//
+// A request to the Nanit API that is running is waited for, and it can
+// take longer than this. Where the container gets more time to stop,
+// NANIT_SHUTDOWN_TIMEOUT can give the clean up more time too.
+const defaultShutdownTimeout = 8 * time.Second
 
 func main() {
 	initLogger()
@@ -98,15 +108,23 @@ func main() {
 		log.Info().Msgf("Event polling enabled with an interval of %v", opts.EventPolling.PollingInterval)
 	}
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+	shutdownTimeout := utils.EnvVarSeconds("NANIT_SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
+	if shutdownTimeout <= 0 {
+		log.Fatal().Msg("Invalid NANIT_SHUTDOWN_TIMEOUT. It must be 1 or more.")
+	}
+
+	// SIGTERM is what a container gets when it is stopped. Without a
+	// handler for it, the program was ended without any clean up, and
+	// the camera kept the place for its stream.
+	interrupt := make(chan os.Signal, 2)
+	signal.Notify(interrupt, os.Interrupt, syscall.SIGTERM)
 
 	instance := app.NewApp(opts)
 
 	runner := utils.RunWithGracefulCancel(instance.Run)
 
-	<-interrupt
-	log.Warn().Msg("Received interrupt signal, terminating")
+	received := <-interrupt
+	log.Warn().Stringer("signal", received).Msg("Received a signal to stop, terminating")
 
 	waitForCleanup := make(chan struct{}, 1)
 
@@ -117,7 +135,9 @@ func main() {
 
 	select {
 	case <-interrupt:
-		log.Fatal().Msg("Received another interrupt signal, forcing termination without clean up")
+		log.Fatal().Msg("Received another signal to stop, forcing termination without clean up")
+	case <-time.After(shutdownTimeout):
+		log.Fatal().Str("waited", shutdownTimeout.String()).Msg("The clean up did not finish in time, forcing termination")
 	case <-waitForCleanup:
 		log.Info().Msg("Clean exit")
 		return

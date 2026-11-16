@@ -343,7 +343,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	log.Info().Str("url", manager.url()).Msg("Connected to websocket")
 
 	// The state says that the connection is alive before the handlers
-	// start, because they look at it
+	// start
 	manager.BabyStateManager.Update(manager.BabyUID, *baby.NewState().SetWebsocketAlive(true))
 
 	// Start the handlers
@@ -370,8 +370,7 @@ func (manager *WebsocketConnectionManager) run(attempt utils.AttemptContext) {
 	select {
 	case <-attempt.Done():
 		// Told to stop. The connection still works, and the state says
-		// so until the handlers have finished: a handler may send a last
-		// message only on a connection that is alive.
+		// so until the handlers have finished and the socket is closed.
 	case <-conn.Done():
 		reason := conn.endReason()
 		log.Error().Err(reason).Msg("Disconnected from server")

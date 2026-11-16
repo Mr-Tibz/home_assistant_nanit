@@ -11,13 +11,13 @@ func TestStateAsMap(t *testing.T) {
 	s := baby.State{}
 	s.SetTemperatureMilli(1000)
 	s.SetIsNight(true)
-	s.SetStreamRequestState(baby.StreamRequestState_Requested)
+	s.SetStreamState(baby.StreamState_Alive)
 
 	m := s.AsMap(false)
 
 	assert.Equal(t, 1.0, m["temperature"], "The two words should be the same.")
 	assert.Equal(t, true, m["is_night"], "The two words should be the same.")
-	assert.NotContains(t, m, "is_stream_requested", "Should not contain internal fields")
+	assert.Len(t, m, 2, "Should not contain internal fields")
 }
 
 func TestStateMergeSame(t *testing.T) {
