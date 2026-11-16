@@ -5,7 +5,6 @@ import (
 	"net"
 	"regexp"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/notedit/rtmp/av"
@@ -14,11 +13,14 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 )
 
-// DefaultReadTimeout - a publisher from which nothing has arrived for
-// this long has ended. A stream can stop without a sign, for example when
-// the camera loses its network for good. Without a limit such a stream
-// counted as running for ever, and nothing asked the camera for a new
-// one.
+// DefaultReadTimeout - a publisher from which no picture, sound or header
+// packet has arrived for this long has ended. A stream can stop without a
+// sign, for example when the camera loses its network for good. Without a
+// limit such a stream counted as running for ever, and nothing asked the
+// camera for a new one.
+//
+// The limit is for packets of the stream, not for any data: a connection
+// that carries only other messages gives the viewers nothing either.
 //
 // The limit is long on purpose. A gap of the network that is shorter
 // passes without any loss but a picture that stands still, because the
@@ -29,32 +31,6 @@ const DefaultReadTimeout = 30 * time.Second
 // subscriberWriteTimeout - time limit for writing one packet to a
 // subscriber
 const subscriberWriteTimeout = 10 * time.Second
-
-// idleConn is a connection whose reads can get a limit for the time
-// without any data. The limit starts again with every read that brings
-// data, whatever that data is. It is switched on for publishers only: a
-// subscriber sends nothing while it takes the stream.
-type idleConn struct {
-	net.Conn
-
-	// limit - the time limit in nanoseconds. 0 means none.
-	limit atomic.Int64
-}
-
-func (conn *idleConn) Read(p []byte) (int, error) {
-	if limit := time.Duration(conn.limit.Load()); limit > 0 {
-		conn.Conn.SetReadDeadline(time.Now().Add(limit))
-	}
-
-	return conn.Conn.Read(p)
-}
-
-// limitIdleTime ends the reads of nc when nothing arrives for limit.
-func limitIdleTime(nc net.Conn, limit time.Duration) {
-	if conn, ok := nc.(*idleConn); ok {
-		conn.limit.Store(int64(limit))
-	}
-}
 
 type rtmpHandler struct {
 	// readTimeout - see DefaultReadTimeout. 0 means no limit.
@@ -67,7 +43,7 @@ type rtmpHandler struct {
 
 // StartRTMPServer - Blocking server
 //
-// readTimeout ends a publisher from which nothing arrives, see
+// readTimeout ends a publisher from which no packet arrives, see
 // DefaultReadTimeout. 0 means the default, and a negative value means no
 // limit.
 func StartRTMPServer(addr string, babyStateManager *baby.StateManager, readTimeout time.Duration) {
@@ -89,7 +65,6 @@ func StartRTMPServer(addr string, babyStateManager *baby.StateManager, readTimeo
 	}
 
 	s := rtmp.NewServer()
-	s.ReplaceRawConn = func(nc net.Conn) net.Conn { return &idleConn{Conn: nc} }
 	s.HandleConn = handler.handleConnection
 
 	for {
@@ -126,10 +101,22 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 
 	if c.Publishing {
 		sublog.Info().Msg("New stream publisher connected")
-		publisher := s.getNewPublisher(babyUID, nc)
 
-		limitIdleTime(nc, s.readTimeout)
-		err := readPackets(c, publisher)
+		// The publisher takes the place of the one before it when its
+		// first packet is there, and not before. A connection that asks
+		// to publish and then sends nothing must not end a stream that
+		// works.
+		first, err := readPacket(c, nc, s.readTimeout)
+		if err != nil {
+			sublog.Warn().Err(err).Msg("Publisher stream closed before it sent anything")
+			nc.Close()
+			return
+		}
+
+		publisher := s.getNewPublisher(babyUID, nc)
+		publisher.broadcast(first)
+
+		err = readPackets(c, nc, publisher, s.readTimeout)
 
 		if s.closePublisher(babyUID, publisher) {
 			sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
@@ -182,11 +169,28 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 	}
 }
 
+// readDeadliner - what reading from a publisher needs of its network
+// connection
+type readDeadliner interface {
+	SetReadDeadline(t time.Time) error
+}
+
+// readPacket reads the next packet of a publisher. With a timeout,
+// reading fails when no packet has arrived for that long.
+func readPacket(c av.PacketReader, nc readDeadliner, timeout time.Duration) (av.Packet, error) {
+	if timeout > 0 {
+		nc.SetReadDeadline(time.Now().Add(timeout))
+	}
+
+	return c.ReadPacket()
+}
+
 // readPackets hands the packets of a publisher to its broadcaster until
-// reading fails, and returns that failure.
-func readPackets(c av.PacketReader, publisher *broadcaster) error {
+// reading fails, and returns that failure. The time limit starts again
+// with every packet.
+func readPackets(c av.PacketReader, nc readDeadliner, publisher *broadcaster, timeout time.Duration) error {
 	for {
-		pkt, err := c.ReadPacket()
+		pkt, err := readPacket(c, nc, timeout)
 		if err != nil {
 			return err
 		}
@@ -196,7 +200,8 @@ func readPackets(c av.PacketReader, publisher *broadcaster) error {
 }
 
 // getNewPublisher registers a new publisher for the baby and marks the
-// stream as alive.
+// stream as alive. It is called when the first packet of the publisher
+// has arrived.
 //
 // The state of the stream changes under the same lock as the list of
 // publishers, here and in closePublisher. A new publisher that comes at

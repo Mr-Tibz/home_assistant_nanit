@@ -11,9 +11,15 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// minSubscriberBuffer - the least number of packets that can wait for one
-// subscriber, see subscriberBufferFor
-const minSubscriberBuffer = 2048
+// minSubscriberBuffer and maxSubscriberBuffer - the least and the largest
+// number of packets that can wait for one subscriber, see
+// subscriberBufferFor. The room is taken when the subscriber connects,
+// about 150 bytes for each packet, so the largest number keeps a long
+// read limit from taking a large amount of memory for every subscriber.
+const (
+	minSubscriberBuffer = 2048
+	maxSubscriberBuffer = 16384
+)
 
 // packetsPerSecond - an upper estimate of the packets of a stream in a
 // second, pictures and sound together
@@ -28,7 +34,9 @@ const packetsPerSecond = 100
 // must not be dropped for that. The longest gap that the stream survives
 // is the read limit of the publisher, so the room follows that limit.
 func subscriberBufferFor(readTimeout time.Duration) int {
-	return max(minSubscriberBuffer, int((readTimeout+10*time.Second).Seconds())*packetsPerSecond)
+	wanted := int((readTimeout + 10*time.Second).Seconds()) * packetsPerSecond
+
+	return min(max(wanted, minSubscriberBuffer), maxSubscriberBuffer)
 }
 
 type subscriber struct {
@@ -186,11 +194,14 @@ func (b *broadcaster) broadcast(pkt av.Packet) {
 			return
 		}
 
-		// The library gives a header packet no time, and it would be
-		// written with the time 0. In the middle of a stream that is a
-		// step back for a viewer, so the header gets the time of the
-		// packet before it.
-		pkt.Time = b.lastTime
+		// The library gives the header packet of the video no time,
+		// and it would be written with the time 0. In the middle of a
+		// stream that is a step back for a viewer, so it gets the time
+		// of the packet before it. The library writes the header packet
+		// of the sound with the time 0 whatever is set here.
+		if pkt.Type == av.H264DecoderConfig {
+			pkt.Time = b.lastTime
+		}
 
 	default:
 		b.lastTime = pkt.Time
