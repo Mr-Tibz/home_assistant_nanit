@@ -55,20 +55,19 @@ const (
 	streamStableAfter = 60 * time.Second
 
 	// streamTimeoutsBeforeReconnect - after this many requests in a row
-	// without an answer, the connection is given up and made again,
-	// unless the idle limit watches over it (see
-	// streamConnection.Watched). The connection itself may be the
-	// cause, and without the idle limit a connection that is dead gives
-	// no other sign.
+	// without any answer, the connection is given up and made again.
+	// The connection itself may be the cause, and a connection that is
+	// dead gives no other sign when the idle limit does not apply to it.
 	streamTimeoutsBeforeReconnect = 3
 
-	// streamTimeoutsBeforeReconnectWatched - the same for a connection
-	// that the idle limit watches over. Such a connection reaches the
+	// streamTimeoutsBeforeReconnectWithIdleLimit - the same for a
+	// connection to which the idle limit applies (see
+	// streamConnection.IdleLimitApplies). Such a connection reaches the
 	// service. What lies behind the service, on the way to the camera,
 	// can still be at fault, and a new connection can repair that. If
 	// the camera is switched off, a new connection changes nothing, so
 	// this number is larger.
-	streamTimeoutsBeforeReconnectWatched = 10
+	streamTimeoutsBeforeReconnectWithIdleLimit = 10
 )
 
 // errNoAnswers - the reason for giving up a connection on which the
@@ -90,9 +89,9 @@ type streamConnection interface {
 	// Done is closed when the connection has ended
 	Done() <-chan struct{}
 
-	// Watched reports whether the idle limit watches over this
+	// IdleLimitApplies reports whether the idle limit applies to this
 	// connection, so that it is given up when it stops carrying data
-	Watched() bool
+	IdleLimitApplies() bool
 }
 
 // streamPace holds what the keepers of one camera know about its stream
@@ -175,6 +174,10 @@ type streamKeeper struct {
 	stopTimeout      time.Duration
 	stableAfter      time.Duration
 
+	// unanswered - requests for the stream on this connection since the
+	// last answer of the camera to one, see streamPace.lostOnConnection
+	unanswered int
+
 	// onPause - called when the keeper starts to wait for the time of
 	// the next request. For tests.
 	onPause func()
@@ -202,11 +205,16 @@ func (keeper *streamKeeper) streamAlive() bool {
 	return keeper.states.GetBabyState(keeper.babyUID).GetStreamState() == baby.StreamState_Alive
 }
 
-// send sends one request about the stream and waits for the answer. It
-// returns errKeeperStopped when ctx is done first. A nil ctx waits for
-// the answer in every case.
-func (keeper *streamKeeper) send(ctx utils.GracefulContext, status client.Streaming_Status, timeout time.Duration) error {
-	awaitResponse := keeper.conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
+// standby reports whether the camera is known to be in standby. It sends
+// no video then, so there is nothing to ask for.
+func (keeper *streamKeeper) standby() bool {
+	return keeper.states.GetBabyState(keeper.babyUID).GetStandby()
+}
+
+// request sends one request about the stream and returns the function
+// that waits for the answer.
+func (keeper *streamKeeper) request(status client.Streaming_Status) func(time.Duration) (*client.Response, error) {
+	return keeper.conn.SendRequest(client.RequestType_PUT_STREAMING, &client.Request{
 		Streaming: &client.Streaming{
 			Id:       client.StreamIdentifier(client.StreamIdentifier_MOBILE).Enum(),
 			RtmpUrl:  utils.ConstRefStr(keeper.targetURL),
@@ -214,11 +222,12 @@ func (keeper *streamKeeper) send(ctx utils.GracefulContext, status client.Stream
 			Attempts: utils.ConstRefInt32(1),
 		},
 	})
+}
 
-	if ctx == nil {
-		_, err := awaitResponse(timeout)
-		return err
-	}
+// send sends one request about the stream and waits for the answer. It
+// returns errKeeperStopped when ctx is done first.
+func (keeper *streamKeeper) send(ctx utils.GracefulContext, status client.Streaming_Status, timeout time.Duration) error {
+	awaitResponse := keeper.request(status)
 
 	// The wait for the answer has its own time limit, so this goroutine
 	// ends by itself also when nobody takes its result
@@ -261,8 +270,16 @@ func (keeper *streamKeeper) start(ctx utils.GracefulContext) (stopAnswered bool,
 	// From here on the camera may act on the request, and the pause
 	// before the next one starts
 	keeper.pace.requested(keeper.retryPauses)
+	keeper.unanswered++
 
-	return stopAnswered, keeper.send(ctx, client.Streaming_STARTED, keeper.requestTimeout)
+	err = keeper.send(ctx, client.Streaming_STARTED, keeper.requestTimeout)
+
+	// Every result but these three is an answer of the camera
+	if !errors.Is(err, client.ErrRequestTimeout) && !errors.Is(err, client.ErrConnectionClosed) && !errors.Is(err, errKeeperStopped) {
+		keeper.unanswered = 0
+	}
+
+	return stopAnswered, err
 }
 
 // stop asks the camera to stop the stream to our address, so that the
@@ -282,7 +299,14 @@ func (keeper *streamKeeper) stop() {
 
 	log.Info().Str("target", keeper.targetURL).Msg("Stopping local streaming")
 
-	if err := keeper.send(nil, client.Streaming_STOPPED, keeper.stopTimeout); err != nil && !errors.Is(err, client.ErrConnectionClosed) {
+	_, err := keeper.request(client.Streaming_STOPPED)(keeper.stopTimeout)
+
+	switch {
+	case err == nil:
+		// The camera has stopped the stream, so there is none to stop
+		// at a later moment
+		keeper.pace.mayStream = false
+	case !errors.Is(err, client.ErrConnectionClosed):
 		log.Warn().Err(err).Msg("Unable to stop local streaming")
 	}
 }
@@ -321,11 +345,12 @@ func (keeper *streamKeeper) wait(ctx utils.GracefulContext, changed <-chan struc
 // like at a stop of the program, it still works at that moment, and run
 // stops the stream.
 func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
-	// changed - the state of the stream may have changed
+	// changed - the state of the stream or the standby of the camera may
+	// have changed
 	changed := make(chan struct{}, 1)
 
 	unsubscribe := keeper.states.Subscribe(func(babyUID string, update baby.State) {
-		if babyUID == keeper.babyUID && update.StreamState != nil {
+		if babyUID == keeper.babyUID && (update.StreamState != nil || update.Standby != nil) {
 			select {
 			case changed <- struct{}{}:
 			default:
@@ -346,7 +371,7 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		case <-keeper.conn.Done():
 			// The connection has ended. Requests that got no answer on
 			// it were most likely lost with it.
-			keeper.pace.lostOnConnection(timeouts)
+			keeper.pace.lostOnConnection(keeper.unanswered)
 		default:
 			// The connection works, so it was given up on purpose. A
 			// stream that the camera may send on our request, or that
@@ -358,9 +383,12 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 	}()
 
 	for {
-		// While the stream runs, there is nothing to ask
+		// While the stream runs, there is nothing to ask. A stream that
+		// has arrived shows that the requests reach the camera.
 		if keeper.streamAlive() {
 			awaited = false
+			timeouts = 0
+			keeper.unanswered = 0
 
 			if keeper.pace.aliveSince.IsZero() {
 				keeper.pace.aliveSince = time.Now()
@@ -386,6 +414,19 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		}
 
 		keeper.pace.aliveSince = time.Time{}
+
+		// A camera in standby sends no video. Asking for it would only
+		// get one refusal after the other, for as long as the standby
+		// lasts.
+		if keeper.standby() {
+			awaited = false
+
+			if keeper.wait(ctx, changed, 0) == waitStopped {
+				return
+			}
+
+			continue
+		}
 
 		// The pause since the last request. Whatever ends the wait, the
 		// top of the loop looks again whether the stream is there: it
@@ -428,7 +469,6 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		case errors.Is(err, client.ErrConnectionClosed):
 			// The connection has ended. That says nothing about the
 			// stream, and the keeper of the next connection goes on.
-			timeouts++
 			return
 
 		case errors.Is(err, client.ErrRequestTimeout):
@@ -446,8 +486,8 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 			timeouts++
 
 			limit := streamTimeoutsBeforeReconnect
-			if keeper.conn.Watched() {
-				limit = streamTimeoutsBeforeReconnectWatched
+			if keeper.conn.IdleLimitApplies() {
+				limit = streamTimeoutsBeforeReconnectWithIdleLimit
 			}
 
 			if timeouts >= limit {
