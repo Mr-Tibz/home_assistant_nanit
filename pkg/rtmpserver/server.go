@@ -72,8 +72,13 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 			pkt, err := c.ReadPacket()
 			if err != nil {
 				sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
-				s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
-				s.closePublisher(babyUID, publisher)
+
+				// A publisher that a newer one has replaced says nothing
+				// about the stream when it ends: the newer one sends it.
+				if s.closePublisher(babyUID, publisher) {
+					s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
+				}
+
 				return
 			}
 
@@ -140,14 +145,19 @@ func (s *rtmpHandler) getNewSubscriber(babyUID string) (*subscriber, func()) {
 	return sub, func() { broadcaster.unsubscribe(sub) }
 }
 
-func (s *rtmpHandler) closePublisher(babyUID string, b *broadcaster) {
+// closePublisher ends the publisher b. It reports whether b was the
+// publisher of the baby at that moment, and not one that a newer
+// publisher has replaced.
+func (s *rtmpHandler) closePublisher(babyUID string, b *broadcaster) bool {
 	s.broadcastersMu.Lock()
-	if currBroadcaster, hasExistingBroadcaster := s.broadcastersByUID[babyUID]; hasExistingBroadcaster {
-		if currBroadcaster == b {
-			delete(s.broadcastersByUID, babyUID)
-		}
+	currBroadcaster, hasExistingBroadcaster := s.broadcastersByUID[babyUID]
+	wasCurrent := hasExistingBroadcaster && currBroadcaster == b
+	if wasCurrent {
+		delete(s.broadcastersByUID, babyUID)
 	}
 	s.broadcastersMu.Unlock()
 
 	b.closeSubscribers()
+
+	return wasCurrent
 }

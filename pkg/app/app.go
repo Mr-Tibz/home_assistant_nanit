@@ -136,19 +136,38 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 			app.runWebsocket(baby.UID, conn, childCtx)
 		})
 
+		var poll utils.GracefulRunner
+
 		if app.Opts.EventPolling.Enabled {
-			go app.pollMessages(baby.UID, app.BabyStateManager)
+			poll = ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+				app.pollMessages(childCtx, baby.UID, app.BabyStateManager)
+			})
 		}
 
-		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
-			ws.RunWithinContext(childCtx)
-		})
+		// The connection runs in this goroutine, and this function
+		// returns when the connection has been given up in order. A
+		// stop of the program waits for this function, so it waits
+		// until the stream is stopped and the socket is closed. Run as
+		// a child that nobody waits for, the connection was cut off in
+		// the middle of that.
+		ws.RunWithinContext(ctx)
+
+		// The same holds for the message poll: a child of this context
+		// is waited for only when this function does that.
+		if poll != nil {
+			poll.Wait()
+		}
+
+		return
 	}
 
 	<-ctx.Done()
 }
 
-func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager) {
+// pollMessages asks for new messages at an interval, until ctx is done. A
+// stop of the program waits for a round that is running, so that a
+// renewal of the token inside it can store its result.
+func (app *App) pollMessages(ctx utils.GracefulContext, babyUID string, babyStateManager *baby.StateManager) {
 	// A loop, and not a call of itself at the end of each round: that
 	// call added a frame to the stack of the goroutine at every round,
 	// for as long as the program ran.
@@ -173,7 +192,11 @@ func (app *App) pollMessages(babyUID string, babyStateManager *baby.StateManager
 		}
 
 		// wait for the specified interval
-		time.Sleep(app.Opts.EventPolling.PollingInterval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(app.Opts.EventPolling.PollingInterval):
+		}
 	}
 }
 
@@ -239,49 +262,13 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 	// 	},
 	// })
 
-	var cleanup func()
-
 	// Local streaming
 	if app.Opts.RTMP != nil {
-		initializeLocalStreaming := func() {
-			requestLocalStreaming(babyUID, app.getLocalStreamURL(babyUID), client.Streaming_STARTED, conn, app.BabyStateManager)
-		}
-
-		// Watch for stream liveness change
-		unsubscribe := app.BabyStateManager.Subscribe(func(updatedBabyUID string, stateUpdate baby.State) {
-			// Do another streaming request if stream just turned unhealthy
-			if updatedBabyUID == babyUID && stateUpdate.StreamState != nil && *stateUpdate.StreamState == baby.StreamState_Unhealthy {
-				// Prevent duplicate request if we already received failure
-				if app.BabyStateManager.GetBabyState(babyUID).GetStreamRequestState() != baby.StreamRequestState_RequestFailed {
-					go initializeLocalStreaming()
-				}
-			}
-		})
-
-		cleanup = func() {
-			// Stop listening for stream liveness change
-			unsubscribe()
-
-			// Stop local streaming
-			state := app.BabyStateManager.GetBabyState(babyUID)
-			if state.GetIsWebsocketAlive() && state.GetStreamState() == baby.StreamState_Alive {
-				requestLocalStreaming(babyUID, app.getLocalStreamURL(babyUID), client.Streaming_STOPPED, conn, app.BabyStateManager)
-			}
-		}
-
-		// Initialize local streaming upon connection if we know that the stream is not alive
-		babyState := app.BabyStateManager.GetBabyState(babyUID)
-		if babyState.GetStreamState() != baby.StreamState_Alive {
-			if babyState.GetStreamRequestState() != baby.StreamRequestState_Requested || babyState.GetStreamState() == baby.StreamState_Unhealthy {
-				go initializeLocalStreaming()
-			}
-		}
+		newStreamKeeper(babyUID, app.getLocalStreamURL(babyUID), conn, app.BabyStateManager).run(childCtx)
+		return
 	}
 
 	<-childCtx.Done()
-	if cleanup != nil {
-		cleanup()
-	}
 }
 
 func (app *App) getRemoteStreamURL(babyUID string) string {
