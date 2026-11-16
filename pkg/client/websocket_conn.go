@@ -46,8 +46,9 @@ type WebsocketConnection struct {
 	closeOnce sync.Once
 	closeErr  error
 
-	// pingsAnswered - the other end has answered a ping
-	pingsAnswered atomic.Bool
+	// watched - the idle limit applies: there is one, and the other end
+	// has answered a ping
+	watched atomic.Bool
 
 	msgHandlersMu sync.RWMutex
 	msgHandlers   []WebsocketMessageHandler
@@ -118,11 +119,11 @@ func (conn *WebsocketConnection) GiveUp(reason error) {
 	conn.end(reason)
 }
 
-// AnswersPings reports whether the other end has answered a ping on this
-// connection. From then on the idle limit applies, so such a connection
+// Watched reports whether the idle limit watches over this connection:
+// there is one, and the other end has answered a ping. Such a connection
 // is given up when it stops carrying data.
-func (conn *WebsocketConnection) AnswersPings() bool {
-	return conn.pingsAnswered.Load()
+func (conn *WebsocketConnection) Watched() bool {
+	return conn.watched.Load()
 }
 
 // endReason returns why the connection has ended. Call it after Done.
@@ -319,13 +320,15 @@ func (conn *WebsocketConnection) handleMessage(m *Message) {
 // connection would be ended and made again without end.
 func (conn *WebsocketConnection) read(idleTimeout time.Duration) {
 	extend := func() {
-		if idleTimeout > 0 && conn.pingsAnswered.Load() {
+		if conn.watched.Load() {
 			conn.socket.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
 	}
 
 	conn.socket.SetPongHandler(func(string) error {
-		conn.pingsAnswered.Store(true)
+		if idleTimeout > 0 {
+			conn.watched.Store(true)
+		}
 		extend()
 		return nil
 	})

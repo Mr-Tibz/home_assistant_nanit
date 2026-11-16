@@ -41,8 +41,8 @@ type fakeCamera struct {
 	done    chan struct{}
 	endOnce sync.Once
 
-	// answersPings - what AnswersPings reports
-	answersPings bool
+	// watched - what Watched reports
+	watched bool
 
 	// hold - when set, the answer to a request to start the stream is
 	// kept back until this channel is closed
@@ -104,11 +104,11 @@ func (camera *fakeCamera) SendRequest(reqType client.RequestType, request *clien
 	}
 }
 
-func (camera *fakeCamera) AnswersPings() bool {
+func (camera *fakeCamera) Watched() bool {
 	camera.mu.Lock()
 	defer camera.mu.Unlock()
 
-	return camera.answersPings
+	return camera.watched
 }
 
 func (camera *fakeCamera) GiveUp(reason error) {
@@ -165,7 +165,7 @@ func startKeeper(t *testing.T, camera *fakeCamera, prepare func(states *baby.Sta
 	camera.states = states
 	camera.mu.Unlock()
 
-	keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states)
+	keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states, &streamPace{})
 	keeper.retryPauses = []time.Duration{20 * time.Millisecond}
 	keeper.publisherTimeout = 60 * time.Millisecond
 	keeper.stableAfter = 30 * time.Millisecond
@@ -420,24 +420,61 @@ func TestKeeperGivesUpAConnectionWithoutAnswers(t *testing.T) {
 	assert.Equal(t, streamTimeoutsBeforeReconnect, camera.starts)
 }
 
-// A connection that answers pings works. When the requests get no answer
-// on it, the camera is the cause, and a new connection would not change
-// that: the keeper goes on asking.
-func TestKeeperKeepsAConnectionThatAnswersPings(t *testing.T) {
+// A connection that the idle limit watches over reaches the service. When
+// the requests get no answer on it, the cause lies behind the service,
+// and most often it is a camera that is switched off. Such a connection
+// is given up too, but after more requests.
+func TestKeeperKeepsAWatchedConnectionForLonger(t *testing.T) {
 	camera := newFakeCamera(client.ErrRequestTimeout)
-	camera.answersPings = true
+	camera.watched = true
 
 	startKeeper(t, camera, nil)
 
-	for i := 0; i < 2*streamTimeoutsBeforeReconnect; i++ {
-		camera.expect(t, stopped, started)
+	select {
+	case reason := <-camera.gaveUp:
+		assert.Equal(t, errNoAnswers, reason)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection was not given up")
 	}
 
-	select {
-	case <-camera.gaveUp:
-		t.Fatal("the connection was given up")
-	default:
+	camera.mu.Lock()
+	defer camera.mu.Unlock()
+	assert.Equal(t, streamTimeoutsBeforeReconnectWatched, camera.starts)
+}
+
+// The time of the next request belongs to the camera, not to one
+// connection. A connection that is made again and again does not lead to
+// a request each time.
+func TestKeeperOfTheNextConnectionKeepsThePause(t *testing.T) {
+	pace := &streamPace{}
+	states := baby.NewStateManager()
+
+	run := func(camera *fakeCamera) utils.GracefulRunner {
+		camera.states = states
+
+		keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states, pace)
+		keeper.retryPauses = []time.Duration{time.Hour}
+
+		return utils.RunWithGracefulCancel(keeper.run)
 	}
+
+	// The first connection: the request is refused, and the connection
+	// ends
+	first := newFakeCamera(errLimit)
+	firstRunner := run(first)
+
+	first.expect(t, stopped, started)
+	time.Sleep(100 * time.Millisecond)
+
+	first.endOnce.Do(func() { close(first.done) })
+	firstRunner.Cancel()
+
+	// The next connection: the pause of an hour is not over
+	second := newFakeCamera(nil)
+	secondRunner := run(second)
+	defer secondRunner.Cancel()
+
+	second.expectNoRequest(t)
 }
 
 // An answer between requests without an answer starts the count again.

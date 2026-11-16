@@ -66,19 +66,11 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 		sublog.Info().Msg("New stream publisher connected")
 		publisher := s.getNewPublisher(babyUID)
 
-		s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Alive))
-
 		for {
 			pkt, err := c.ReadPacket()
 			if err != nil {
 				sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
-
-				// A publisher that a newer one has replaced says nothing
-				// about the stream when it ends: the newer one sends it.
-				if s.closePublisher(babyUID, publisher) {
-					s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
-				}
-
+				s.closePublisher(babyUID, publisher)
 				return
 			}
 
@@ -115,12 +107,20 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 	}
 }
 
+// getNewPublisher registers a new publisher for the baby and marks the
+// stream as alive.
+//
+// The state of the stream changes under the same lock as the list of
+// publishers, here and in closePublisher. A new publisher that comes at
+// the moment an old one ends can therefore not be followed by the state
+// "ended" of the old one.
 func (s *rtmpHandler) getNewPublisher(babyUID string) *broadcaster {
 	broadcaster := newBroadcaster()
 
 	s.broadcastersMu.Lock()
 	existingBroadcaster, hadExistingBroadcaster := s.broadcastersByUID[babyUID]
 	s.broadcastersByUID[babyUID] = broadcaster
+	s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Alive))
 	s.broadcastersMu.Unlock()
 
 	if hadExistingBroadcaster {
@@ -145,19 +145,17 @@ func (s *rtmpHandler) getNewSubscriber(babyUID string) (*subscriber, func()) {
 	return sub, func() { broadcaster.unsubscribe(sub) }
 }
 
-// closePublisher ends the publisher b. It reports whether b was the
-// publisher of the baby at that moment, and not one that a newer
-// publisher has replaced.
-func (s *rtmpHandler) closePublisher(babyUID string, b *broadcaster) bool {
+// closePublisher ends the publisher b. If b was the publisher of the baby
+// at that moment, the stream is marked as ended. A publisher that a newer
+// one has replaced says nothing about the stream when it ends: the newer
+// one sends it.
+func (s *rtmpHandler) closePublisher(babyUID string, b *broadcaster) {
 	s.broadcastersMu.Lock()
-	currBroadcaster, hasExistingBroadcaster := s.broadcastersByUID[babyUID]
-	wasCurrent := hasExistingBroadcaster && currBroadcaster == b
-	if wasCurrent {
+	if currBroadcaster, hasExistingBroadcaster := s.broadcastersByUID[babyUID]; hasExistingBroadcaster && currBroadcaster == b {
 		delete(s.broadcastersByUID, babyUID)
+		s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
 	}
 	s.broadcastersMu.Unlock()
 
 	b.closeSubscribers()
-
-	return wasCurrent
 }

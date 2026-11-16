@@ -54,11 +54,19 @@ const (
 
 	// streamTimeoutsBeforeReconnect - after this many requests in a row
 	// without an answer, the connection is given up and made again,
-	// unless the connection has shown that it works (see
-	// streamConnection.AnswersPings). The connection itself may be the
-	// cause, and a connection that is dead gives no other sign when the
-	// service answers no ping.
+	// unless the idle limit watches over it (see
+	// streamConnection.Watched). The connection itself may be the
+	// cause, and without the idle limit a connection that is dead gives
+	// no other sign.
 	streamTimeoutsBeforeReconnect = 3
+
+	// streamTimeoutsBeforeReconnectWatched - the same for a connection
+	// that the idle limit watches over. Such a connection reaches the
+	// service. What lies behind the service, on the way to the camera,
+	// can still be at fault, and a new connection can repair that. If
+	// the camera is switched off, a new connection changes nothing, so
+	// this number is larger.
+	streamTimeoutsBeforeReconnectWatched = 10
 )
 
 // errNoAnswers - the reason for giving up a connection on which the
@@ -80,10 +88,33 @@ type streamConnection interface {
 	// Done is closed when the connection has ended
 	Done() <-chan struct{}
 
-	// AnswersPings reports whether the other end has answered a ping on
-	// this connection. Such a connection is watched for its end by the
-	// idle limit.
-	AnswersPings() bool
+	// Watched reports whether the idle limit watches over this
+	// connection, so that it is given up when it stops carrying data
+	Watched() bool
+}
+
+// streamPace holds the time of the next request for the stream of one
+// camera. It outlives the websocket connections, so that a connection
+// that is made again and again does not lead to a request each time.
+type streamPace struct {
+	// requests - requests in a row, see streamRetryPauses
+	requests int
+
+	// nextRequest - no request before this moment
+	nextRequest time.Time
+}
+
+// requested records a request and sets the time of the next one.
+func (pace *streamPace) requested(pauses []time.Duration) {
+	pace.requests++
+	pace.nextRequest = time.Now().Add(pauses[min(pace.requests, len(pauses))-1])
+}
+
+// streamIsGood records that a stream has run for a while. The request
+// after it follows at once.
+func (pace *streamPace) streamIsGood() {
+	pace.requests = 0
+	pace.nextRequest = time.Time{}
 }
 
 // streamKeeper asks the camera to send its stream to this program, for
@@ -98,6 +129,10 @@ type streamKeeper struct {
 	conn      streamConnection
 	states    *baby.StateManager
 
+	// pace - shared with the keepers of the connections before and after
+	// this one. They run one after the other, never at the same time.
+	pace *streamPace
+
 	retryPauses      []time.Duration
 	requestTimeout   time.Duration
 	publisherTimeout time.Duration
@@ -105,12 +140,13 @@ type streamKeeper struct {
 	stableAfter      time.Duration
 }
 
-func newStreamKeeper(babyUID string, targetURL string, conn streamConnection, states *baby.StateManager) *streamKeeper {
+func newStreamKeeper(babyUID string, targetURL string, conn streamConnection, states *baby.StateManager, pace *streamPace) *streamKeeper {
 	return &streamKeeper{
 		babyUID:   babyUID,
 		targetURL: targetURL,
 		conn:      conn,
 		states:    states,
+		pace:      pace,
 
 		retryPauses:      streamRetryPauses,
 		requestTimeout:   streamRequestTimeout,
@@ -262,17 +298,15 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		}
 	}()
 
-	// requests - requests in a row, see streamRetryPauses
-	// timeouts - requests in a row without an answer
-	// nextRequest - no request before this moment
-	requests, timeouts := 0, 0
-	var nextRequest time.Time
+	// timeouts - requests in a row without an answer on this connection
+	timeouts := 0
 
 	for {
 		// While the stream runs, there is nothing to ask
 		if keeper.streamAlive() {
+			// A stream that has run for a while ends the row of requests
 			stableAfter := keeper.stableAfter
-			if requests == 0 {
+			if keeper.pace.requests == 0 {
 				stableAfter = 0
 			}
 
@@ -280,24 +314,22 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 			case waitStopped:
 				return
 			case waitElapsed:
-				requests, timeouts = 0, 0
-				nextRequest = time.Time{}
+				keeper.pace.streamIsGood()
+				timeouts = 0
 			}
 
 			continue
 		}
 
-		// The pause since the last request
-		if pause := time.Until(nextRequest); pause > 0 {
+		// The pause since the last request. Whatever ends the wait, the
+		// top of the loop looks again whether the stream is there: it
+		// can have started at the very end of the pause.
+		if pause := time.Until(keeper.pace.nextRequest); pause > 0 {
 			if keeper.wait(ctx, changed, pause) == waitStopped {
 				return
 			}
 
-			// The pause is over, or the stream may be there. The top of
-			// the loop finds out which.
-			if time.Now().Before(nextRequest) {
-				continue
-			}
+			continue
 		}
 
 		select {
@@ -307,8 +339,7 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		}
 
 		mayStream = true
-		requests++
-		nextRequest = time.Now().Add(keeper.retryPauses[min(requests, len(keeper.retryPauses))-1])
+		keeper.pace.requested(keeper.retryPauses)
 
 		err := keeper.start(ctx)
 
@@ -338,10 +369,12 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		case errors.Is(err, client.ErrRequestTimeout):
 			timeouts++
 
-			// A connection that answers pings works, and the idle limit
-			// watches over it. Then the camera is what gives no answer,
-			// and a new connection would not change that.
-			if timeouts >= streamTimeoutsBeforeReconnect && !keeper.conn.AnswersPings() {
+			limit := streamTimeoutsBeforeReconnect
+			if keeper.conn.Watched() {
+				limit = streamTimeoutsBeforeReconnectWatched
+			}
+
+			if timeouts >= limit {
 				log.Warn().Int("requests", timeouts).Msg("The requests for the stream get no answer. Making the websocket connection again")
 				keeper.conn.GiveUp(errNoAnswers)
 				return

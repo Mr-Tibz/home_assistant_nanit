@@ -132,8 +132,12 @@ func (app *App) handleBaby(baby baby.Baby, ctx utils.GracefulContext) {
 		ws.PingInterval = app.Opts.Websocket.PingInterval
 		ws.IdleTimeout = app.Opts.Websocket.IdleTimeout
 
+		// The time of the next request for the stream belongs to the
+		// camera, not to one connection
+		pace := &streamPace{}
+
 		ws.WithReadyConnection(func(conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
-			app.runWebsocket(baby.UID, conn, childCtx)
+			app.runWebsocket(baby.UID, conn, pace, childCtx)
 		})
 
 		var poll utils.GracefulRunner
@@ -200,7 +204,7 @@ func (app *App) pollMessages(ctx utils.GracefulContext, babyUID string, babyStat
 	}
 }
 
-func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, childCtx utils.GracefulContext) {
+func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, pace *streamPace, childCtx utils.GracefulContext) {
 	// Reading sensor data
 	conn.RegisterMessageHandler(func(m *client.Message, conn *client.WebsocketConnection) {
 		// Sensor request initiated by us on start (or some other client, we don't care)
@@ -264,7 +268,7 @@ func (app *App) runWebsocket(babyUID string, conn *client.WebsocketConnection, c
 
 	// Local streaming
 	if app.Opts.RTMP != nil {
-		newStreamKeeper(babyUID, app.getLocalStreamURL(babyUID), conn, app.BabyStateManager).run(childCtx)
+		newStreamKeeper(babyUID, app.getLocalStreamURL(babyUID), conn, app.BabyStateManager, pace).run(childCtx)
 		return
 	}
 

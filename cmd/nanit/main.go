@@ -108,6 +108,11 @@ func main() {
 		log.Info().Msgf("Event polling enabled with an interval of %v", opts.EventPolling.PollingInterval)
 	}
 
+	shutdownTimeout := utils.EnvVarSeconds("NANIT_SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
+	if shutdownTimeout <= 0 {
+		log.Fatal().Msg("Invalid NANIT_SHUTDOWN_TIMEOUT. It must be 1 or more.")
+	}
+
 	// SIGTERM is what a container gets when it is stopped. Without a
 	// handler for it, the program was ended without any clean up, and
 	// the camera kept the place for its stream.
@@ -117,11 +122,6 @@ func main() {
 	instance := app.NewApp(opts)
 
 	runner := utils.RunWithGracefulCancel(instance.Run)
-
-	shutdownTimeout := utils.EnvVarSeconds("NANIT_SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
-	if shutdownTimeout <= 0 {
-		log.Fatal().Msg("Invalid NANIT_SHUTDOWN_TIMEOUT. It must be 1 or more.")
-	}
 
 	received := <-interrupt
 	log.Warn().Stringer("signal", received).Msg("Received a signal to stop, terminating")
