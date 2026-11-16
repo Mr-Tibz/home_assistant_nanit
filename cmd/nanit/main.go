@@ -95,8 +95,13 @@ func main() {
 			ReadTimeout: utils.EnvVarSeconds("NANIT_RTMP_READ_TIMEOUT", rtmpserver.DefaultReadTimeout),
 		}
 
-		if opts.RTMP.ReadTimeout < 0 {
+		switch {
+		case opts.RTMP.ReadTimeout < 0:
 			log.Fatal().Msg("Invalid NANIT_RTMP_READ_TIMEOUT. It must be 0 or more.")
+		case opts.RTMP.ReadTimeout == 0:
+			// 0 turns the limit off. In the options, a negative value
+			// says so, because 0 stands for the default there.
+			opts.RTMP.ReadTimeout = -1
 		}
 	}
 

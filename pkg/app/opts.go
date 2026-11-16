@@ -50,8 +50,9 @@ type RTMPOpts struct {
 	// IP:Port under which can Cam reach the RTMP server
 	PublicAddr string
 
-	// ReadTimeout - a stream from which no packet has arrived for this
-	// long has ended, and a new one is asked for. 0 means no limit.
+	// ReadTimeout - a stream from which nothing has arrived for this
+	// long has ended, and a new one is asked for. 0 means the default
+	// of the receiver, and a negative value means no limit.
 	ReadTimeout time.Duration
 }
 

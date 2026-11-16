@@ -2,6 +2,7 @@ package rtmpserver
 
 import (
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -77,7 +78,7 @@ func isClosed(sub *subscriber) bool {
 // when it joins while the stream runs. Of each kind of header packet it
 // gets the newest one.
 func TestBroadcasterSendsTheHeadersFirst(t *testing.T) {
-	b := newBroadcaster(&fakeConn{})
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
 
 	b.broadcast(header(av.H264DecoderConfig, 1))
 	b.broadcast(header(av.AACDecoderConfig, 2))
@@ -106,7 +107,7 @@ func TestBroadcasterSendsTheHeadersFirst(t *testing.T) {
 // after it are made for it. A header packet that only repeats the one
 // before is not sent again.
 func TestBroadcasterSendsAChangedHeaderToItsSubscribers(t *testing.T) {
-	b := newBroadcaster(&fakeConn{})
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
 
 	b.broadcast(header(av.H264DecoderConfig, 1))
 
@@ -118,13 +119,47 @@ func TestBroadcasterSendsAChangedHeaderToItsSubscribers(t *testing.T) {
 	b.broadcast(header(av.H264DecoderConfig, 4))
 	b.broadcast(video(5))
 
+	// The library gives a header packet no time. It gets the time of the
+	// packet before it, so that the times of a viewer never go back.
+	changedConfig := header(av.H264DecoderConfig, 4)
+	changedConfig.Time = video(3).Time
+
 	assert.Equal(t, []av.Packet{
 		header(av.H264DecoderConfig, 1),
 		video(2),
 		video(3),
-		header(av.H264DecoderConfig, 4),
+		changedConfig,
 		video(5),
 	}, take(sub))
+}
+
+// When the publisher ends, a viewer still gets the packets that wait for
+// it, and then sees the end. Only a viewer that is dropped for being too
+// slow loses what waits for it.
+func TestBroadcasterLeavesTheLastPacketsToItsSubscribers(t *testing.T) {
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
+	sub := b.newSubscriber()
+
+	b.broadcast(video(1))
+	b.broadcast(video(2))
+	b.closeSubscribers()
+
+	var packets []av.Packet
+	for pkt := range sub.pktC {
+		packets = append(packets, pkt)
+	}
+
+	assert.Equal(t, []av.Packet{video(1), video(2)}, packets)
+	assert.False(t, sub.tooSlow.Load())
+}
+
+// The room for the packets that wait for a viewer follows the time that a
+// silent stream is kept: after a gap of that length the camera can send
+// what it has kept in one go.
+func TestSubscriberBufferFollowsTheReadLimit(t *testing.T) {
+	assert.Equal(t, 4000, subscriberBufferFor(DefaultReadTimeout))
+	assert.Equal(t, 13000, subscriberBufferFor(2*time.Minute))
+	assert.Equal(t, minSubscriberBuffer, subscriberBufferFor(0), "no limit")
 }
 
 // Sound in the Opus format is sound, not a header. The old rule took
@@ -140,7 +175,7 @@ func TestWhichPacketsAreHeaders(t *testing.T) {
 		assert.False(t, isHeader(av.Packet{Type: packetType}), av.PacketTypeString[packetType])
 	}
 
-	b := newBroadcaster(&fakeConn{})
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
 	sub := b.newSubscriber()
 
 	b.broadcast(av.Packet{Type: av.OPUS})
@@ -158,7 +193,7 @@ func TestWhichPacketsAreHeaders(t *testing.T) {
 // publisher waited for the slowest subscriber, and the stream stopped for
 // all.
 func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
-	b := newBroadcaster(&fakeConn{})
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
 
 	slow := b.newSubscriber()
 	fast := b.newSubscriber()
@@ -173,7 +208,7 @@ func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
 		}
 	}()
 
-	const packets = 3 * subscriberBuffer
+	const packets = 3 * minSubscriberBuffer
 
 	broadcastDone := make(chan struct{})
 	go func() {
@@ -182,7 +217,7 @@ func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
 			b.broadcast(video(i))
 
 			// Let the fast subscriber keep up
-			for len(fast.pktC) > subscriberBuffer/2 {
+			for len(fast.pktC) > minSubscriberBuffer/2 {
 				time.Sleep(time.Millisecond)
 			}
 		}
@@ -217,7 +252,7 @@ func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
 // channel of a subscriber twice, or handing a packet to a closed one,
 // ended the program.
 func TestBroadcasterCanBeClosedFromEverySide(t *testing.T) {
-	b := newBroadcaster(&fakeConn{})
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
 
 	subs := make([]*subscriber, 16)
 	for i := range subs {
@@ -265,83 +300,94 @@ func TestBroadcasterCanBeClosedFromEverySide(t *testing.T) {
 	assert.True(t, isClosed(b.newSubscriber()), "a subscriber that comes after the end gets a closed channel")
 }
 
-// fakePublisher is a stand-in for the connection of a publisher. It sends
-// a number of packets, one every interval, and then nothing more, without
-// closing.
-type fakePublisher struct {
-	packets  int
-	interval time.Duration
-
-	deadline  time.Time
-	deadlines int
-}
-
-var errTimeout = errors.New("i/o timeout")
-
-func (publisher *fakePublisher) SetReadDeadline(t time.Time) error {
-	publisher.deadline = t
-	publisher.deadlines++
-
-	return nil
-}
-
-func (publisher *fakePublisher) ReadPacket() (av.Packet, error) {
-	if publisher.packets > 0 {
-		time.Sleep(publisher.interval)
-
-		if !publisher.deadline.IsZero() && time.Now().After(publisher.deadline) {
-			return av.Packet{}, errTimeout
-		}
-
-		publisher.packets--
-
-		return video(publisher.packets), nil
-	}
-
-	if publisher.deadline.IsZero() {
-		return av.Packet{}, errors.New("the test ends a publisher without a time limit here")
-	}
-
-	// Nothing arrives any more: the read ends at its deadline
-	time.Sleep(time.Until(publisher.deadline))
-
-	return av.Packet{}, errTimeout
-}
-
 // A stream can stop without a sign, for example when the camera loses its
-// network. The read then ends at its time limit. Without a limit the
-// stream counted as running for ever.
+// network. With a limit, a read on the connection of the publisher then
+// ends. Without one, the stream counted as running for ever.
 //
-// The limit is for the time without a packet, not for the stream as a
-// whole: the packets here take longer together than the limit.
-func TestReadPacketsEndsWhenThePublisherSendsNothing(t *testing.T) {
-	// The time limit is many times the time between two packets, so that
-	// a slow machine does not end the stream early
-	publisher := &fakePublisher{packets: 10, interval: 40 * time.Millisecond}
-	b := newBroadcaster(&fakeConn{})
+// The limit is for the time without any data, not for the stream as a
+// whole: the data here arrives over a longer time than the limit.
+func TestIdleConnEndsAReadWhenNothingArrives(t *testing.T) {
+	publisher, receiver := net.Pipe()
+	defer publisher.Close()
+	defer receiver.Close()
+
+	conn := &idleConn{Conn: receiver}
+	limitIdleTime(conn, 300*time.Millisecond)
+
+	// Data every 30 ms for 600 ms, and then silence
+	go func() {
+		for i := 0; i < 20; i++ {
+			if _, err := publisher.Write([]byte{byte(i)}); err != nil {
+				return
+			}
+			time.Sleep(30 * time.Millisecond)
+		}
+	}()
+
+	received := 0
+	buffer := make([]byte, 16)
+
+	for {
+		n, err := conn.Read(buffer)
+		received += n
+
+		if err != nil {
+			var netErr net.Error
+			require.True(t, errors.As(err, &netErr) && netErr.Timeout(), "got: %v", err)
+			break
+		}
+	}
+
+	assert.Equal(t, 20, received, "everything before the silence has arrived")
+}
+
+// Without a limit, a read waits for as long as it takes. That is what a
+// subscriber needs, which sends nothing while it takes the stream.
+func TestIdleConnWithoutALimit(t *testing.T) {
+	publisher, receiver := net.Pipe()
+	defer publisher.Close()
+	defer receiver.Close()
+
+	conn := &idleConn{Conn: receiver}
+
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		publisher.Write([]byte{1})
+	}()
+
+	n, err := conn.Read(make([]byte, 16))
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, n)
+}
+
+// scriptedReader hands out a number of packets, and then fails.
+type scriptedReader struct {
+	packets int
+}
+
+var errReadFailed = errors.New("i/o timeout")
+
+func (reader *scriptedReader) ReadPacket() (av.Packet, error) {
+	if reader.packets == 0 {
+		return av.Packet{}, errReadFailed
+	}
+
+	reader.packets--
+
+	return video(reader.packets), nil
+}
+
+// readPackets hands every packet on, and returns the failure that ends
+// the stream.
+func TestReadPackets(t *testing.T) {
+	b := newBroadcaster(&fakeConn{}, minSubscriberBuffer)
 	sub := b.newSubscriber()
 
-	result := make(chan error, 1)
-	go func() { result <- readPackets(publisher, publisher, b, 300*time.Millisecond) }()
+	err := readPackets(&scriptedReader{packets: 5}, b)
 
-	select {
-	case err := <-result:
-		assert.Equal(t, errTimeout, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("reading did not end")
-	}
-
-	assert.Len(t, take(sub), 10, "every packet before the silence was handed on")
-	assert.Equal(t, 11, publisher.deadlines, "the time limit started again with every packet")
-}
-
-// Without a time limit, no deadline is set.
-func TestReadPacketsWithoutATimeLimit(t *testing.T) {
-	publisher := &fakePublisher{packets: 3}
-	b := newBroadcaster(&fakeConn{})
-
-	assert.Error(t, readPackets(publisher, publisher, b, 0))
-	assert.Equal(t, 0, publisher.deadlines)
+	assert.Equal(t, errReadFailed, err)
+	assert.Len(t, take(sub), 5)
 }
 
 // When the camera starts a new stream, the old one ends a moment later.

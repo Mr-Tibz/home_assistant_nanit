@@ -5,18 +5,31 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/notedit/rtmp/av"
+	"github.com/rs/zerolog/log"
 )
 
-// subscriberBuffer - packets that can wait for one subscriber. A
-// subscriber that falls this far behind is dropped, see send.
+// minSubscriberBuffer - the least number of packets that can wait for one
+// subscriber, see subscriberBufferFor
+const minSubscriberBuffer = 2048
+
+// packetsPerSecond - an upper estimate of the packets of a stream in a
+// second, pictures and sound together
+const packetsPerSecond = 100
+
+// subscriberBufferFor returns the number of packets that can wait for one
+// subscriber. A subscriber that falls this far behind is dropped, see
+// send.
 //
 // The number is large on purpose. After a gap of its network, the camera
 // can send what it has kept in one go, and a subscriber that is healthy
-// must not be dropped for that. With about 75 packets a second, this is
-// about half a minute.
-const subscriberBuffer = 2048
+// must not be dropped for that. The longest gap that the stream survives
+// is the read limit of the publisher, so the room follows that limit.
+func subscriberBufferFor(readTimeout time.Duration) int {
+	return max(minSubscriberBuffer, int((readTimeout+10*time.Second).Seconds())*packetsPerSecond)
+}
 
 type subscriber struct {
 	// pktC - closed when the subscriber gets no more packets: the
@@ -38,15 +51,25 @@ type broadcaster struct {
 	// publisher - the connection of the publisher
 	publisher io.Closer
 
+	// buffer - packets that can wait for one subscriber
+	buffer int
+
 	mu          sync.Mutex
 	closed      bool
 	headerPkts  []av.Packet
 	subscribers map[*subscriber]struct{}
+
+	// lastTime - the time of the last picture or sound packet
+	lastTime time.Duration
+
+	// opusSeen - sound in the Opus format has arrived, see broadcast
+	opusSeen bool
 }
 
-func newBroadcaster(publisher io.Closer) *broadcaster {
+func newBroadcaster(publisher io.Closer, buffer int) *broadcaster {
 	return &broadcaster{
 		publisher:   publisher,
+		buffer:      buffer,
 		subscribers: make(map[*subscriber]struct{}),
 	}
 }
@@ -66,17 +89,17 @@ func isHeader(pkt av.Packet) bool {
 // stream. When the publisher has ended already, the subscriber gets a
 // channel that is closed.
 func (b *broadcaster) newSubscriber() *subscriber {
-	sub := &subscriber{
-		pktC: make(chan av.Packet, subscriberBuffer),
-	}
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.closed {
+		sub := &subscriber{pktC: make(chan av.Packet)}
 		close(sub.pktC)
+
 		return sub
 	}
+
+	sub := &subscriber{pktC: make(chan av.Packet, b.buffer)}
 
 	b.subscribers[sub] = struct{}{}
 	b.send(sub, b.headerPkts...)
@@ -93,23 +116,14 @@ func (b *broadcaster) unsubscribe(sub *subscriber) {
 }
 
 // drop removes sub and closes its channel, if it is still a subscriber.
-// The packets that wait in the channel are thrown away first, so that the
-// subscriber sees the end at once and not after it has taken them all.
-// The caller holds the lock.
+// The subscriber still gets the packets that wait in the channel, and
+// then sees the end. The caller holds the lock.
 func (b *broadcaster) drop(sub *subscriber) {
 	if _, subscribed := b.subscribers[sub]; !subscribed {
 		return
 	}
 
 	delete(b.subscribers, sub)
-
-	for len(sub.pktC) > 0 {
-		select {
-		case <-sub.pktC:
-		default:
-		}
-	}
-
 	close(sub.pktC)
 }
 
@@ -124,7 +138,20 @@ func (b *broadcaster) drop(sub *subscriber) {
 func (b *broadcaster) send(sub *subscriber, packets ...av.Packet) {
 	if cap(sub.pktC)-len(sub.pktC) < len(packets) {
 		sub.tooSlow.Store(true)
+
+		// Throw away what waits for it, so that it sees the end at once
+		// and not after it has taken all of that. Those packets are old
+		// by now, and the subscriber is to connect again for the live
+		// stream.
+		for len(sub.pktC) > 0 {
+			select {
+			case <-sub.pktC:
+			default:
+			}
+		}
+
 		b.drop(sub)
+
 		return
 	}
 
@@ -135,13 +162,6 @@ func (b *broadcaster) send(sub *subscriber, packets ...av.Packet) {
 
 // broadcast hands a packet of the publisher to every subscriber.
 func (b *broadcaster) broadcast(pkt av.Packet) {
-	// The library that writes the packets to the subscribers cannot
-	// write sound in the Opus format: it ends the program on such a
-	// packet. The camera sends its sound in the AAC format.
-	if pkt.Type == av.OPUS {
-		return
-	}
-
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -149,8 +169,31 @@ func (b *broadcaster) broadcast(pkt av.Packet) {
 		return
 	}
 
-	if isHeader(pkt) && !b.keepHeader(pkt) {
+	switch {
+	case pkt.Type == av.OPUS:
+		// The library that writes the packets to the subscribers cannot
+		// write sound in the Opus format: it ends the program on such a
+		// packet. The camera sends its sound in the AAC format.
+		if !b.opusSeen {
+			b.opusSeen = true
+			log.Warn().Msg("The stream carries sound in the Opus format, which cannot be handed on. The viewers get no sound")
+		}
+
 		return
+
+	case isHeader(pkt):
+		if !b.keepHeader(pkt) {
+			return
+		}
+
+		// The library gives a header packet no time, and it would be
+		// written with the time 0. In the middle of a stream that is a
+		// step back for a viewer, so the header gets the time of the
+		// packet before it.
+		pkt.Time = b.lastTime
+
+	default:
+		b.lastTime = pkt.Time
 	}
 
 	for sub := range b.subscribers {

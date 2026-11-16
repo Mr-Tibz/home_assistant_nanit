@@ -5,6 +5,7 @@ import (
 	"net"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/notedit/rtmp/av"
@@ -13,7 +14,7 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 )
 
-// DefaultReadTimeout - a publisher from which no packet has arrived for
+// DefaultReadTimeout - a publisher from which nothing has arrived for
 // this long has ended. A stream can stop without a sign, for example when
 // the camera loses its network for good. Without a limit such a stream
 // counted as running for ever, and nothing asked the camera for a new
@@ -29,6 +30,32 @@ const DefaultReadTimeout = 30 * time.Second
 // subscriber
 const subscriberWriteTimeout = 10 * time.Second
 
+// idleConn is a connection whose reads can get a limit for the time
+// without any data. The limit starts again with every read that brings
+// data, whatever that data is. It is switched on for publishers only: a
+// subscriber sends nothing while it takes the stream.
+type idleConn struct {
+	net.Conn
+
+	// limit - the time limit in nanoseconds. 0 means none.
+	limit atomic.Int64
+}
+
+func (conn *idleConn) Read(p []byte) (int, error) {
+	if limit := time.Duration(conn.limit.Load()); limit > 0 {
+		conn.Conn.SetReadDeadline(time.Now().Add(limit))
+	}
+
+	return conn.Conn.Read(p)
+}
+
+// limitIdleTime ends the reads of nc when nothing arrives for limit.
+func limitIdleTime(nc net.Conn, limit time.Duration) {
+	if conn, ok := nc.(*idleConn); ok {
+		conn.limit.Store(int64(limit))
+	}
+}
+
 type rtmpHandler struct {
 	// readTimeout - see DefaultReadTimeout. 0 means no limit.
 	readTimeout time.Duration
@@ -40,8 +67,9 @@ type rtmpHandler struct {
 
 // StartRTMPServer - Blocking server
 //
-// readTimeout ends a publisher from which no packet arrives, see
-// DefaultReadTimeout. 0 means no limit.
+// readTimeout ends a publisher from which nothing arrives, see
+// DefaultReadTimeout. 0 means the default, and a negative value means no
+// limit.
 func StartRTMPServer(addr string, babyStateManager *baby.StateManager, readTimeout time.Duration) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -51,9 +79,17 @@ func StartRTMPServer(addr string, babyStateManager *baby.StateManager, readTimeo
 
 	log.Info().Str("addr", addr).Msg("RTMP server started")
 
-	s := rtmp.NewServer()
 	handler := newRtmpHandler(babyStateManager)
-	handler.readTimeout = readTimeout
+
+	switch {
+	case readTimeout == 0:
+		handler.readTimeout = DefaultReadTimeout
+	case readTimeout > 0:
+		handler.readTimeout = readTimeout
+	}
+
+	s := rtmp.NewServer()
+	s.ReplaceRawConn = func(nc net.Conn) net.Conn { return &idleConn{Conn: nc} }
 	s.HandleConn = handler.handleConnection
 
 	for {
@@ -92,12 +128,13 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 		sublog.Info().Msg("New stream publisher connected")
 		publisher := s.getNewPublisher(babyUID, nc)
 
-		err := readPackets(c, nc, publisher, s.readTimeout)
+		limitIdleTime(nc, s.readTimeout)
+		err := readPackets(c, publisher)
 
 		if s.closePublisher(babyUID, publisher) {
 			sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
 		} else {
-			sublog.Info().Msg("Publisher stream closed, because a newer publisher has taken its place")
+			sublog.Info().Err(err).Msg("Publisher stream closed. A newer publisher has taken its place")
 		}
 
 		nc.Close()
@@ -145,21 +182,10 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 	}
 }
 
-// readDeadliner - what readPackets needs of the network connection
-type readDeadliner interface {
-	SetReadDeadline(t time.Time) error
-}
-
 // readPackets hands the packets of a publisher to its broadcaster until
-// reading fails, and returns that failure. With a timeout, reading fails
-// also when no packet has arrived for that long. The time limit starts
-// again with every packet.
-func readPackets(c av.PacketReader, nc readDeadliner, publisher *broadcaster, timeout time.Duration) error {
+// reading fails, and returns that failure.
+func readPackets(c av.PacketReader, publisher *broadcaster) error {
 	for {
-		if timeout > 0 {
-			nc.SetReadDeadline(time.Now().Add(timeout))
-		}
-
 		pkt, err := c.ReadPacket()
 		if err != nil {
 			return err
@@ -181,7 +207,7 @@ func readPackets(c av.PacketReader, nc readDeadliner, publisher *broadcaster, ti
 // publisher takes its place: the camera has started a new stream then,
 // and the old one is of no use any more.
 func (s *rtmpHandler) getNewPublisher(babyUID string, conn io.Closer) *broadcaster {
-	broadcaster := newBroadcaster(conn)
+	broadcaster := newBroadcaster(conn, subscriberBufferFor(s.readTimeout))
 
 	s.broadcastersMu.Lock()
 	existingBroadcaster, hadExistingBroadcaster := s.broadcastersByUID[babyUID]
