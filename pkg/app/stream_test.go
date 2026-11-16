@@ -383,17 +383,28 @@ func TestKeeperSendsNothingWhenTheConnectionWasLost(t *testing.T) {
 // Nothing was accepted, so there is nothing to stop.
 func TestKeeperStopsDuringAPause(t *testing.T) {
 	camera := newFakeCamera(errLimit)
+	paused := make(chan struct{}, 1)
 
 	test := startKeeper(t, camera, func(_ *baby.StateManager, keeper *streamKeeper) {
 		keeper.retryPauses = []time.Duration{time.Hour}
+		keeper.onPause = func() {
+			select {
+			case paused <- struct{}{}:
+			default:
+			}
+		}
 	})
 
 	camera.expect(t, stopped, started)
 
-	// The request is on its way at this point. Give the keeper the time
-	// to take the refusal and to start its pause: a stop during the
+	// The request is on its way at this point. Wait until the keeper has
+	// taken the refusal and has started its pause: a stop during the
 	// request itself is another case, with another result.
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the keeper did not start its pause")
+	}
 
 	test.stop(t)
 
@@ -448,12 +459,14 @@ func TestKeeperKeepsAWatchedConnectionForLonger(t *testing.T) {
 func TestKeeperOfTheNextConnectionKeepsThePause(t *testing.T) {
 	pace := &streamPace{}
 	states := baby.NewStateManager()
+	paused := make(chan struct{}, 4)
 
 	run := func(camera *fakeCamera) utils.GracefulRunner {
 		camera.states = states
 
 		keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states, pace)
 		keeper.retryPauses = []time.Duration{time.Hour}
+		keeper.onPause = func() { paused <- struct{}{} }
 
 		return utils.RunWithGracefulCancel(keeper.run)
 	}
@@ -464,7 +477,12 @@ func TestKeeperOfTheNextConnectionKeepsThePause(t *testing.T) {
 	firstRunner := run(first)
 
 	first.expect(t, stopped, started)
-	time.Sleep(100 * time.Millisecond)
+
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the keeper did not start its pause")
+	}
 
 	first.endOnce.Do(func() { close(first.done) })
 	firstRunner.Cancel()
@@ -472,9 +490,52 @@ func TestKeeperOfTheNextConnectionKeepsThePause(t *testing.T) {
 	// The next connection: the pause of an hour is not over
 	second := newFakeCamera(nil)
 	secondRunner := run(second)
-	defer secondRunner.Cancel()
 
 	second.expectNoRequest(t)
+
+	// The program stops in that pause. The first request was refused, so
+	// the camera sends nothing, and there is nothing to stop.
+	secondRunner.Cancel()
+	second.expectNoRequest(t)
+}
+
+// A request without an answer can still make the camera send its stream.
+// When the program stops, the camera is asked to stop the stream, also
+// when the request went out on an earlier connection.
+func TestKeeperStopsAStreamThatAnEarlierConnectionAskedFor(t *testing.T) {
+	pace := &streamPace{}
+	states := baby.NewStateManager()
+	paused := make(chan struct{}, 4)
+
+	run := func(camera *fakeCamera) utils.GracefulRunner {
+		camera.states = states
+
+		keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states, pace)
+		keeper.retryPauses = []time.Duration{time.Hour}
+		keeper.onPause = func() { paused <- struct{}{} }
+
+		return utils.RunWithGracefulCancel(keeper.run)
+	}
+
+	// The first connection: the request gets no answer, and the
+	// connection ends
+	first := newFakeCamera(client.ErrRequestTimeout)
+	firstRunner := run(first)
+
+	first.expect(t, stopped, started)
+	<-paused
+
+	first.endOnce.Do(func() { close(first.done) })
+	firstRunner.Cancel()
+
+	// The next connection is in the pause when the program stops
+	second := newFakeCamera(nil)
+	secondRunner := run(second)
+
+	<-paused
+	secondRunner.Cancel()
+
+	second.expect(t, stopped)
 }
 
 // An answer between requests without an answer starts the count again.

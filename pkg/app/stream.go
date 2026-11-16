@@ -93,19 +93,33 @@ type streamConnection interface {
 	Watched() bool
 }
 
-// streamPace holds the time of the next request for the stream of one
-// camera. It outlives the websocket connections, so that a connection
-// that is made again and again does not lead to a request each time.
+// streamPace holds what the keepers of one camera know about its stream
+// across the websocket connections: when the next request is due, and
+// whether the camera may be sending. It outlives the connections, so that
+// a connection that is made again and again does not lead to a request
+// each time, and so that a stream that was asked for on an earlier
+// connection is still stopped at a stop of the program.
 type streamPace struct {
 	// requests - requests in a row, see streamRetryPauses
 	requests int
 
 	// nextRequest - no request before this moment
 	nextRequest time.Time
+
+	// mayStream - the camera may send its stream on a request of this
+	// program, or be about to: a request was sent, and the camera has
+	// not refused it. That includes a request without an answer.
+	mayStream bool
+
+	// aliveSince - when the stream that runs was first seen. Zero when
+	// no stream runs.
+	aliveSince time.Time
 }
 
-// requested records a request and sets the time of the next one.
+// requested records that a request for the stream is sent, and sets the
+// time of the next one.
 func (pace *streamPace) requested(pauses []time.Duration) {
+	pace.mayStream = true
 	pace.requests++
 	pace.nextRequest = time.Now().Add(pauses[min(pace.requests, len(pauses))-1])
 }
@@ -138,6 +152,10 @@ type streamKeeper struct {
 	publisherTimeout time.Duration
 	stopTimeout      time.Duration
 	stableAfter      time.Duration
+
+	// onPause - called when the keeper starts to wait for the time of
+	// the next request. For tests.
+	onPause func()
 }
 
 func newStreamKeeper(babyUID string, targetURL string, conn streamConnection, states *baby.StateManager, pace *streamPace) *streamKeeper {
@@ -213,6 +231,11 @@ func (keeper *streamKeeper) start(ctx utils.GracefulContext) error {
 
 	log.Info().Str("target", keeper.targetURL).Msg("Requesting local streaming")
 
+	// From here on the camera may act on the request, and the pause
+	// before the next one starts. A request that could not be sent,
+	// because the connection had ended, uses up no pause.
+	keeper.pace.requested(keeper.retryPauses)
+
 	return keeper.send(ctx, client.Streaming_STARTED, keeper.requestTimeout)
 }
 
@@ -285,15 +308,10 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 	})
 	defer unsubscribe()
 
-	// mayStream - the camera may send its stream on a request of this
-	// connection, or be about to: a request was sent, and the camera has
-	// not refused it. That includes a request without an answer.
-	mayStream := false
-
 	// The one way out. A stream that the camera may send on our request,
 	// or that runs, is stopped, see stop.
 	defer func() {
-		if mayStream || keeper.streamAlive() {
+		if keeper.pace.mayStream || keeper.streamAlive() {
 			keeper.stop()
 		}
 	}()
@@ -304,13 +322,19 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 	for {
 		// While the stream runs, there is nothing to ask
 		if keeper.streamAlive() {
-			// A stream that has run for a while ends the row of requests
-			stableAfter := keeper.stableAfter
-			if keeper.pace.requests == 0 {
-				stableAfter = 0
+			if keeper.pace.aliveSince.IsZero() {
+				keeper.pace.aliveSince = time.Now()
 			}
 
-			switch keeper.wait(ctx, changed, stableAfter) {
+			// A stream that has run for a while ends the row of
+			// requests. The time counts from when the stream was first
+			// seen, also by the keeper of an earlier connection.
+			untilGood := time.Duration(0)
+			if keeper.pace.requests > 0 {
+				untilGood = max(keeper.stableAfter-time.Since(keeper.pace.aliveSince), time.Nanosecond)
+			}
+
+			switch keeper.wait(ctx, changed, untilGood) {
 			case waitStopped:
 				return
 			case waitElapsed:
@@ -321,10 +345,16 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 			continue
 		}
 
+		keeper.pace.aliveSince = time.Time{}
+
 		// The pause since the last request. Whatever ends the wait, the
 		// top of the loop looks again whether the stream is there: it
 		// can have started at the very end of the pause.
 		if pause := time.Until(keeper.pace.nextRequest); pause > 0 {
+			if keeper.onPause != nil {
+				keeper.onPause()
+			}
+
 			if keeper.wait(ctx, changed, pause) == waitStopped {
 				return
 			}
@@ -337,9 +367,6 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 			return
 		default:
 		}
-
-		mayStream = true
-		keeper.pace.requested(keeper.retryPauses)
 
 		err := keeper.start(ctx)
 
@@ -384,8 +411,9 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 
 		default:
 			// The camera has refused the request, so it sends no stream
-			// for it
-			mayStream = false
+			// for it. A stream of an earlier request was stopped before
+			// this request was sent.
+			keeper.pace.mayStream = false
 			timeouts = 0
 
 			if err.Error() == streamLimitMessage {
