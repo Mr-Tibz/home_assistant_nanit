@@ -27,8 +27,11 @@
 #   NANIT_REVISION     what the program logs as its version at the start,
 #                      for example the commit that is deployed (default: none)
 #
-# Every other setting of .env.sample is passed on to the program when it
-# is set, see the list under "environment" below.
+# The other settings of .env.sample are passed on to the program when they
+# are set, see the list under "environment" below. Not in that list are
+# the folder for the data and the place of the session file in the
+# container, and the time for the clean up at a stop, which this file
+# sets to fit stop_grace_period.
 
 name: nanit
 
@@ -57,10 +60,13 @@ services:
 
     environment:
       - "NANIT_RTMP_ADDR=${NANIT_RTMP_HOST:?Set NANIT_RTMP_HOST to the address of this machine that the camera can reach, without a port, for example 192.168.1.10}:${NANIT_RTMP_PORT:-1935}"
-      - "NANIT_SHUTDOWN_TIMEOUT=${NANIT_SHUTDOWN_TIMEOUT:-25}"
+      # Less than stop_grace_period above, which is the moment the
+      # container is killed
+      - "NANIT_SHUTDOWN_TIMEOUT=25"
 
       # Passed on when they are set, see .env.sample for what they do
       - NANIT_LOG_LEVEL
+      - NANIT_RTMP_ENABLED
       - NANIT_EMAIL
       - NANIT_PASSWORD
       - NANIT_REFRESH_TOKEN

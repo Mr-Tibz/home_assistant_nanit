@@ -122,13 +122,17 @@ jobs:
         env:
           REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      # Without settings the program starts, and stops with the name of
-      # the one setting that it needs.
+      # Without settings the program starts, logs the version that the
+      # build gave it, and stops with the name of the one setting that it
+      # needs.
       - name: Start the program in the image
         run: |
           output="$(docker run --rm nanit:from-source 2>&1 || true)"
           echo "$output"
+          echo "$output" | grep -q "gitversion=.*${REVISION::7}"
           echo "$output" | grep -q "Missing environment variable NANIT_RTMP_ADDR"
+        env:
+          REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # The certificates are for the program: without them it cannot check
       # the servers of Nanit. The stop test below has no network, so this

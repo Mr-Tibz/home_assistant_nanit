@@ -5,20 +5,19 @@ ARG GO_VERSION=1.27
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
 WORKDIR /app
 
-# The modules first, so that a change of the source does not fetch them
-# again. The builder keeps the two caches between builds, so a change of
-# the source compiles only what has changed.
+# The modules first, in a layer of their own, so that a change of the
+# source does not fetch them again
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
 COPY cmd ./cmd
 COPY pkg ./pkg
 
+# The builder keeps the cache of the compiler between builds, so a change
+# of the source compiles only what has changed
 ARG CI_COMMIT_SHORT_SHA
 ARG TARGETOS TARGETARCH
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
+RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X main.GitCommit=$CI_COMMIT_SHORT_SHA" -o ./bin/nanit ./cmd/nanit/
 
 FROM debian:trixie-slim

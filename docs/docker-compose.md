@@ -66,7 +66,7 @@ NANIT_RTMP_HOST=192.168.1.10
 NANIT_DATA_PATH=/srv/nanit-data
 ```
 
-Every other setting of [.env.sample](../.env.sample) can go in the same file. The top of the compose file lists a few more that belong to the deployment, for example how to put the container on a Docker network that exists already, so that a media server on that network can read the stream.
+The other settings of [.env.sample](../.env.sample) can go in the same file. Write a `$` in a value as `$$`, or Compose takes what follows it for the name of a variable. The top of the compose file lists a few more settings that belong to the deployment, for example how to put the container on a Docker network that exists already, so that a media server on that network can read the stream.
 
 Make `session.json`, which is the sign-in to Nanit, with the setup script of the image. It asks for the e-mail address, the password and the code that Nanit sends:
 
