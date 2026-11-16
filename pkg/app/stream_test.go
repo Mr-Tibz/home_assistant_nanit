@@ -28,6 +28,9 @@ type fakeCamera struct {
 	answers []error
 	starts  int
 
+	// stopAnswer - answer to every request to stop the stream
+	stopAnswer error
+
 	// requests - every request, in the order sent
 	requests chan client.Streaming_Status
 
@@ -72,7 +75,7 @@ func (camera *fakeCamera) SendRequest(reqType client.RequestType, request *clien
 	camera.mu.Lock()
 	camera.urls = append(camera.urls, request.GetStreaming().GetRtmpUrl())
 
-	var answer error
+	answer := camera.stopAnswer
 	if status == client.Streaming_STARTED {
 		answer = camera.answers[min(camera.starts, len(camera.answers)-1)]
 		camera.starts++
@@ -111,7 +114,9 @@ func (camera *fakeCamera) Watched() bool {
 	return camera.watched
 }
 
+// GiveUp ends the connection, as the real one does.
 func (camera *fakeCamera) GiveUp(reason error) {
+	camera.endOnce.Do(func() { close(camera.done) })
 	camera.gaveUp <- reason
 }
 
@@ -167,7 +172,7 @@ func startKeeper(t *testing.T, camera *fakeCamera, prepare func(states *baby.Sta
 
 	keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states, &streamPace{})
 	keeper.retryPauses = []time.Duration{20 * time.Millisecond}
-	keeper.publisherTimeout = 60 * time.Millisecond
+	keeper.publisherTimeout = 40 * time.Millisecond
 	keeper.stableAfter = 30 * time.Millisecond
 
 	if prepare != nil {
@@ -416,6 +421,7 @@ func TestKeeperStopsDuringAPause(t *testing.T) {
 // makes a new one.
 func TestKeeperGivesUpAConnectionWithoutAnswers(t *testing.T) {
 	camera := newFakeCamera(client.ErrRequestTimeout)
+	camera.stopAnswer = client.ErrRequestTimeout
 
 	startKeeper(t, camera, nil)
 
@@ -437,6 +443,7 @@ func TestKeeperGivesUpAConnectionWithoutAnswers(t *testing.T) {
 // is given up too, but after more requests.
 func TestKeeperKeepsAWatchedConnectionForLonger(t *testing.T) {
 	camera := newFakeCamera(client.ErrRequestTimeout)
+	camera.stopAnswer = client.ErrRequestTimeout
 	camera.watched = true
 
 	startKeeper(t, camera, nil)
@@ -478,11 +485,7 @@ func TestKeeperOfTheNextConnectionKeepsThePause(t *testing.T) {
 
 	first.expect(t, stopped, started)
 
-	select {
-	case <-paused:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the keeper did not start its pause")
-	}
+	awaitPause(t, paused)
 
 	first.endOnce.Do(func() { close(first.done) })
 	firstRunner.Cancel()
@@ -523,24 +526,93 @@ func TestKeeperStopsAStreamThatAnEarlierConnectionAskedFor(t *testing.T) {
 	firstRunner := run(first)
 
 	first.expect(t, stopped, started)
-	<-paused
+	awaitPause(t, paused)
 
-	first.endOnce.Do(func() { close(first.done) })
+	// The connection was given up on purpose, and the keeper has asked
+	// the camera to stop
 	firstRunner.Cancel()
+	first.expect(t, stopped)
 
 	// The next connection is in the pause when the program stops
 	second := newFakeCamera(nil)
 	secondRunner := run(second)
 
-	<-paused
+	awaitPause(t, paused)
 	secondRunner.Cancel()
 
 	second.expect(t, stopped)
 }
 
+// Requests that got no answer on a connection that has ended were most
+// likely lost with it. They do not count, and the keeper of the next
+// connection asks at once.
+func TestKeeperOfTheNextConnectionAsksAtOnceAfterALostConnection(t *testing.T) {
+	pace := &streamPace{}
+	states := baby.NewStateManager()
+	paused := make(chan struct{}, 4)
+
+	run := func(camera *fakeCamera) utils.GracefulRunner {
+		camera.states = states
+
+		keeper := newStreamKeeper(testBabyUID, testTargetURL, camera, states, pace)
+		keeper.retryPauses = []time.Duration{time.Hour}
+		keeper.onPause = func() { paused <- struct{}{} }
+
+		return utils.RunWithGracefulCancel(keeper.run)
+	}
+
+	// The first connection is dead: nothing gets an answer, and then it
+	// ends
+	first := newFakeCamera(client.ErrRequestTimeout)
+	first.stopAnswer = client.ErrRequestTimeout
+	firstRunner := run(first)
+
+	first.expect(t, stopped, started)
+	awaitPause(t, paused)
+
+	first.endOnce.Do(func() { close(first.done) })
+	firstRunner.Cancel()
+
+	// The next connection does not wait for the pause of an hour
+	second := newFakeCamera(nil)
+	second.streamArrives = true
+	secondRunner := run(second)
+	defer secondRunner.Cancel()
+
+	second.expect(t, stopped, started)
+}
+
+// A request for the stream that gets no answer, on a connection on which
+// the camera has just answered the stop: the connection works, so it is
+// kept.
+func TestKeeperKeepsAConnectionOnWhichTheStopIsAnswered(t *testing.T) {
+	camera := newFakeCamera(client.ErrRequestTimeout)
+
+	startKeeper(t, camera, nil)
+
+	for i := 0; i < 2*streamTimeoutsBeforeReconnectWatched; i++ {
+		camera.expect(t, stopped, started)
+	}
+
+	select {
+	case <-camera.gaveUp:
+		t.Fatal("the connection was given up")
+	default:
+	}
+}
+
+func awaitPause(t *testing.T, paused <-chan struct{}) {
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the keeper did not start its pause")
+	}
+}
+
 // An answer between requests without an answer starts the count again.
 func TestKeeperCountsOnlyRequestsWithoutAnswerInARow(t *testing.T) {
 	camera := newFakeCamera(client.ErrRequestTimeout, client.ErrRequestTimeout, errLimit, client.ErrRequestTimeout, client.ErrRequestTimeout, errLimit)
+	camera.stopAnswer = client.ErrRequestTimeout
 
 	startKeeper(t, camera, nil)
 

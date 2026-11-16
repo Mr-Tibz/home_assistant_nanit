@@ -37,8 +37,10 @@ const (
 	streamRequestTimeout = 30 * time.Second
 
 	// streamPublisherTimeout - time that the camera gets to start its
-	// stream after it has accepted the request
-	streamPublisherTimeout = 15 * time.Second
+	// stream after it has accepted the request. The next request is not
+	// sent before that, because it begins with a stop, which would end a
+	// stream that is just starting.
+	streamPublisherTimeout = 30 * time.Second
 
 	// streamStopTimeout - time to wait for the answer of the camera to a
 	// request to stop the stream. Stopping is done on the way to
@@ -131,6 +133,26 @@ func (pace *streamPace) streamIsGood() {
 	pace.nextRequest = time.Time{}
 }
 
+// accepted records that the camera has accepted the last request. It
+// gets at least wait to start its stream before the next request.
+func (pace *streamPace) accepted(wait time.Duration) {
+	if earliest := time.Now().Add(wait); pace.nextRequest.Before(earliest) {
+		pace.nextRequest = earliest
+	}
+}
+
+// lostOnConnection takes back requests that got no answer on a
+// connection that has ended. The connection was the cause, so they say
+// nothing about the camera, and the next connection asks at once.
+func (pace *streamPace) lostOnConnection(requests int) {
+	if requests == 0 {
+		return
+	}
+
+	pace.requests = max(pace.requests-requests, 0)
+	pace.nextRequest = time.Time{}
+}
+
 // streamKeeper asks the camera to send its stream to this program, for
 // as long as one websocket connection lasts, and asks again whenever the
 // stream is not there.
@@ -214,7 +236,9 @@ func (keeper *streamKeeper) send(ctx utils.GracefulContext, status client.Stream
 	}
 }
 
-// start asks the camera for the stream.
+// start asks the camera for the stream. It also reports whether the
+// camera has answered the stop that goes before the request, which shows
+// that the connection carries requests and answers.
 //
 // It asks the camera to stop the stream to our address first. The camera
 // can still count a stream that it started for an earlier request of
@@ -223,20 +247,22 @@ func (keeper *streamKeeper) send(ctx utils.GracefulContext, status client.Stream
 // request for lack of places. The camera stops a stream only for the
 // exact address that it was started with, so this stops no stream of
 // another program or phone.
-func (keeper *streamKeeper) start(ctx utils.GracefulContext) error {
-	err := keeper.send(ctx, client.Streaming_STOPPED, keeper.stopTimeout)
+func (keeper *streamKeeper) start(ctx utils.GracefulContext) (stopAnswered bool, err error) {
+	err = keeper.send(ctx, client.Streaming_STOPPED, keeper.stopTimeout)
 	if errors.Is(err, client.ErrConnectionClosed) || errors.Is(err, errKeeperStopped) {
-		return err
+		return false, err
 	}
+
+	// Every other result but a missing answer is an answer of the camera
+	stopAnswered = !errors.Is(err, client.ErrRequestTimeout)
 
 	log.Info().Str("target", keeper.targetURL).Msg("Requesting local streaming")
 
 	// From here on the camera may act on the request, and the pause
-	// before the next one starts. A request that could not be sent,
-	// because the connection had ended, uses up no pause.
+	// before the next one starts
 	keeper.pace.requested(keeper.retryPauses)
 
-	return keeper.send(ctx, client.Streaming_STARTED, keeper.requestTimeout)
+	return stopAnswered, keeper.send(ctx, client.Streaming_STARTED, keeper.requestTimeout)
 }
 
 // stop asks the camera to stop the stream to our address, so that the
@@ -308,20 +334,34 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 	})
 	defer unsubscribe()
 
-	// The one way out. A stream that the camera may send on our request,
-	// or that runs, is stopped, see stop.
+	// timeouts - requests in a row without any answer on this connection
+	// awaited - the camera has accepted a request, and its stream has
+	// not arrived yet
+	timeouts := 0
+	awaited := false
+
+	// The one way out
 	defer func() {
-		if keeper.pace.mayStream || keeper.streamAlive() {
-			keeper.stop()
+		select {
+		case <-keeper.conn.Done():
+			// The connection has ended. Requests that got no answer on
+			// it were most likely lost with it.
+			keeper.pace.lostOnConnection(timeouts)
+		default:
+			// The connection works, so it was given up on purpose. A
+			// stream that the camera may send on our request, or that
+			// runs, is stopped, see stop.
+			if keeper.pace.mayStream || keeper.streamAlive() {
+				keeper.stop()
+			}
 		}
 	}()
-
-	// timeouts - requests in a row without an answer on this connection
-	timeouts := 0
 
 	for {
 		// While the stream runs, there is nothing to ask
 		if keeper.streamAlive() {
+			awaited = false
+
 			if keeper.pace.aliveSince.IsZero() {
 				keeper.pace.aliveSince = time.Now()
 			}
@@ -368,22 +408,19 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		default:
 		}
 
-		err := keeper.start(ctx)
+		if awaited {
+			log.Warn().Msg("The camera has accepted the request, but no stream has arrived. Asking again")
+			awaited = false
+		}
+
+		stopAnswered, err := keeper.start(ctx)
 
 		switch {
 		case err == nil:
 			timeouts = 0
+			awaited = true
+			keeper.pace.accepted(keeper.publisherTimeout)
 			log.Info().Msg("Local streaming successfully requested")
-
-			if !keeper.waitForStream(ctx, changed) {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-
-				log.Warn().Str("waited", keeper.publisherTimeout.String()).Msg("The camera has accepted the request, but no stream has arrived. Asking again")
-			}
 
 		case errors.Is(err, errKeeperStopped):
 			return
@@ -391,9 +428,21 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 		case errors.Is(err, client.ErrConnectionClosed):
 			// The connection has ended. That says nothing about the
 			// stream, and the keeper of the next connection goes on.
+			timeouts++
 			return
 
 		case errors.Is(err, client.ErrRequestTimeout):
+			log.Warn().Msg("Streaming request timeout, trying again")
+
+			// The camera has answered the stop a moment ago, so the
+			// connection carries requests and answers. Then the camera
+			// is what gives no answer to this request, and a new
+			// connection would not change that.
+			if stopAnswered {
+				timeouts = 0
+				continue
+			}
+
 			timeouts++
 
 			limit := streamTimeoutsBeforeReconnect
@@ -406,8 +455,6 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 				keeper.conn.GiveUp(errNoAnswers)
 				return
 			}
-
-			log.Warn().Msg("Streaming request timeout, trying again")
 
 		default:
 			// The camera has refused the request, so it sends no stream
@@ -423,19 +470,4 @@ func (keeper *streamKeeper) run(ctx utils.GracefulContext) {
 			}
 		}
 	}
-}
-
-// waitForStream waits until the stream is there, for the time that the
-// camera gets to start it. It reports whether the stream is there.
-func (keeper *streamKeeper) waitForStream(ctx utils.GracefulContext, changed <-chan struct{}) bool {
-	deadline := time.Now().Add(keeper.publisherTimeout)
-
-	for !keeper.streamAlive() {
-		remaining := time.Until(deadline)
-		if remaining <= 0 || keeper.wait(ctx, changed, remaining) == waitStopped {
-			return false
-		}
-	}
-
-	return true
 }
