@@ -79,3 +79,51 @@ jobs:
       - name: Test (32-bit)
         if: matrix.arch == '386'
         run: go test -count=1 -timeout 120s ./...
+
+  # The image is what people run. Build it the way a deployment does, and
+  # start the program in it once.
+  image:
+    name: Build the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build
+        run: docker build --build-arg CI_COMMIT_SHORT_SHA="${GITHUB_SHA::7}" -t nanit:ci .
+
+      # Without settings the program starts, and stops with the name of
+      # the one setting that it needs.
+      - name: Start the program in the image
+        run: |
+          output="$(docker run --rm nanit:ci 2>&1 || true)"
+          echo "$output"
+          echo "$output" | grep -q "Missing environment variable NANIT_RTMP_ADDR"
+
+      - name: Check the tools of the setup script
+        run: docker run --rm --entrypoint bash nanit:ci -c 'command -v curl && command -v jq && test -x /app/scripts/init-nanit.sh'
+
+      # A container gets SIGTERM when it is stopped. The program must end
+      # in order then, and well within the time that a container gets.
+      - name: Stop the program in a container
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          printf '{"revision":3,"authToken":"x","authTime":"%s","babies":[{"uid":"b1","name":"B","camera_uid":"c1"}],"refreshToken":"r"}' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUNNER_TEMP/data/session.json"
+
+          # No network: the program must not reach the real service with
+          # the made-up session of this test
+          docker run -d --name stop-test --network none -e NANIT_RTMP_ADDR=127.0.0.1:1935 -v "$RUNNER_TEMP/data:/data" nanit:ci
+          sleep 5
+
+          docker stop -t 10 stop-test
+          docker logs stop-test
+
+          test "$(docker inspect stop-test --format '{{.State.ExitCode}}')" = "0"
+          docker logs stop-test 2>&1 | grep -q "Clean exit"
+
+      - name: Check the compose file
+        run: docker compose -f deploy/docker-compose.yml config --quiet
+        env:
+          NANIT_RTMP_ADDR: 192.0.2.1:1935
+          NANIT_DATA_PATH: /tmp/nanit-data

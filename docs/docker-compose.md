@@ -47,3 +47,40 @@ docker-compose up -d # creates new container with fresh image (do this after eve
 # Uninstall the app
 docker-compose down
 ```
+
+## Run from the source of this repository
+
+[deploy/docker-compose.yml](../deploy/docker-compose.yml) builds the image on the machine that runs it, from the repository as it is checked out there. No image registry and no sign-in to one is needed.
+
+```bash
+git clone https://github.com/Mr-Tibz/home_assistant_nanit.git
+cd home_assistant_nanit
+
+# The address of this machine that the camera can reach, and the folder for session.json
+export NANIT_RTMP_ADDR=192.168.1.10:1935
+export NANIT_DATA_PATH=/srv/nanit-data
+
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+The folder behind `NANIT_DATA_PATH` holds `session.json`, which is the sign-in to Nanit (see the [README](../README.md) for how to make it). Keep that folder, and an update needs no new sign-in.
+
+To update, fetch the new source and deploy again. The image is built again each time:
+
+```bash
+git pull
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+The top of the compose file lists the other settings, for example how to put the container on a Docker network that exists already, so that a media server on that network can read the stream.
+
+### Automatic updates with Portainer
+
+A Portainer stack can follow this repository and deploy again when it changes:
+
+1. Stacks, Add stack, Repository.
+2. Repository URL: the address of this repository. Compose path: `deploy/docker-compose.yml`.
+3. Switch on GitOps updates, with polling.
+4. Add the environment variables `NANIT_RTMP_ADDR` and `NANIT_DATA_PATH`.
+
+Each update stops the container for the time of a restart. The program asks the camera to stop its stream first, so the new container gets the stream at once.
