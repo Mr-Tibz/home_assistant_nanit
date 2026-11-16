@@ -68,26 +68,27 @@ const reconnectResetThreshold = 60 * time.Second
 const shortConnection = 10 * time.Second
 
 // refusedByClose reports whether reason says that the server has closed
-// the connection with a close message that does not name a normal or a
-// passing cause. A connection that breaks without a close message, that
-// reaches its idle limit or that cannot be written to has not been
-// refused, and neither has one that the server closes because it
-// restarts.
+// the connection with a close message that names a refusal: a violation
+// of its policy, or a code of the service itself. Every other end is no
+// refusal: a connection that breaks, reaches its idle limit or cannot be
+// written to, and a close that names a restart, a fault of the server or
+// a normal end.
 func refusedByClose(reason error) bool {
-	return websocket.IsUnexpectedCloseError(reason,
-		websocket.CloseNormalClosure,
-		websocket.CloseGoingAway,
-		websocket.CloseAbnormalClosure,
-		websocket.CloseServiceRestart,
-		websocket.CloseTryAgainLater,
-	)
+	var closeErr *websocket.CloseError
+	if !errors.As(reason, &closeErr) {
+		return false
+	}
+
+	// 4000 to 4999 are the codes that a service defines for itself
+	return closeErr.Code == websocket.ClosePolicyViolation || (closeErr.Code >= 4000 && closeErr.Code <= 4999)
 }
 
 // refusalPauses - extra pause after attempts in a row that the server has
 // refused: none after the first one, refusalPauses[0] after the second
 // one, and so on, the last entry from then on. The server has refused an
-// attempt when it answers the handshake with a 4xx status, or accepts the
-// connection and closes it within shortConnection (see refusedByClose).
+// attempt when it answers the handshake with a 4xx status other than 408,
+// or accepts the connection and closes it within shortConnection (see
+// refusedByClose).
 //
 // The short pauses of reconnectCooldown are for failures that pass, like
 // an outage of the network. A refusal is an answer, and asking again at
@@ -509,7 +510,7 @@ func (manager *WebsocketConnectionManager) connect(attempt utils.AttemptContext,
 			// renewal replaces the refresh token, so it is not done on
 			// a guess.
 			return nil, manager.noteRefusal(token), err
-		case status >= 400 && status < 500:
+		case status >= 400 && status < 500 && status != http.StatusRequestTimeout:
 			return nil, manager.noteRefusal(""), err
 		}
 

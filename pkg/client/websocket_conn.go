@@ -26,6 +26,11 @@ var (
 // writeTimeout - time limit for writing one message to the socket
 const writeTimeout = 10 * time.Second
 
+// closeMessageGrace - after a message could not be written, the reader
+// gets this long to come to a close message of the other end, see
+// endAfterFailedWrite
+const closeMessageGrace = time.Second
+
 // WebsocketMessageHandler - message handler
 type WebsocketMessageHandler func(*Message, *WebsocketConnection)
 
@@ -88,6 +93,22 @@ func (conn *WebsocketConnection) end(reason error) {
 	})
 }
 
+// endAfterFailedWrite ends the connection because a message could not be
+// written to it. It does so after a moment and not at once: the other end
+// may have closed the connection with a message that says why, and the
+// write can fail before the reader has come to that message. In that
+// moment the reader can end the connection first, with the reason that
+// the other end gave.
+func (conn *WebsocketConnection) endAfterFailedWrite(writeErr error) {
+	go func() {
+		select {
+		case <-conn.done:
+		case <-time.After(closeMessageGrace):
+			conn.end(fmt.Errorf("unable to send a message: %w", writeErr))
+		}
+	}()
+}
+
 // endReason returns why the connection has ended. Call it after Done.
 func (conn *WebsocketConnection) endReason() error {
 	<-conn.done
@@ -136,7 +157,7 @@ func (conn *WebsocketConnection) SendMessage(m *Message) {
 			}
 		default:
 			log.Warn().Err(err).Msg("Unable to send a message, closing the websocket")
-			conn.end(fmt.Errorf("unable to send a message: %w", err))
+			conn.endAfterFailedWrite(err)
 		}
 	}
 }
@@ -201,25 +222,29 @@ func (conn *WebsocketConnection) SendRequest(reqType RequestType, requestData *R
 
 	// Return awaiter
 	return func(timeout time.Duration) (*Response, error) {
-		// A response that is there counts, whatever else has happened
-		select {
-		case res := <-resC:
-			return finish(res)
-		default:
-		}
-
 		timer := time.NewTimer(timeout)
 		defer timer.Stop()
+
+		var err error
 
 		select {
 		case res := <-resC:
 			return finish(res)
 		case <-conn.done:
-			forget()
-			return nil, ErrConnectionClosed
+			err = ErrConnectionClosed
 		case <-timer.C:
-			forget()
-			return nil, ErrRequestTimeout
+			err = ErrRequestTimeout
+		}
+
+		forget()
+
+		// When a response has arrived at the same moment, it counts:
+		// the camera has acted on the request.
+		select {
+		case res := <-resC:
+			return finish(res)
+		default:
+			return nil, err
 		}
 	}
 }

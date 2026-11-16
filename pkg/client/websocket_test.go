@@ -490,8 +490,10 @@ func TestWebsocketWaitsLongerWhenTheServerKeepsRefusing(t *testing.T) {
 // A server that closes the connection because it restarts has not refused
 // it, and neither has a connection that breaks or reaches its idle limit.
 func TestWhichEndsOfAConnectionCountAsRefused(t *testing.T) {
+	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseNormalClosure}))
 	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseGoingAway}))
 	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseServiceRestart}))
+	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseInternalServerErr}), "a fault of the server")
 	assert.False(t, refusedByClose(&websocket.CloseError{Code: websocket.CloseAbnormalClosure}), "a connection that breaks")
 	assert.False(t, refusedByClose(errors.New("i/o timeout")), "the idle limit")
 	assert.True(t, refusedByClose(&websocket.CloseError{Code: websocket.ClosePolicyViolation}))
@@ -514,13 +516,23 @@ func TestWebsocketDefaultIdleLimit(t *testing.T) {
 }
 
 // A server that accepts the connection and closes it at once refuses it
-// too, in another way.
+// too, in another way. The handlers send their first requests as soon as
+// the connection is there, as the program does. Such a write can fail
+// before the reader has come to the close message. The reason for the end
+// must still be that message.
 func TestWebsocketWaitsLongerWhenTheServerKeepsClosingAtOnce(t *testing.T) {
 	relay := newFakeRelay(t)
 	relay.closeAtOnce = 8
 
 	tc := startConnection(t, relay, func(manager *WebsocketConnectionManager) {
 		manager.RefusalPauses = []time.Duration{time.Hour}
+
+		manager.WithReadyConnection(func(conn *WebsocketConnection, ctx utils.GracefulContext) {
+			for i := 0; i < 3; i++ {
+				conn.SendRequest(RequestType_GET_SENSOR_DATA, &Request{})
+			}
+			<-ctx.Done()
+		})
 	})
 
 	await(t, relay.tokens, "the first handshake")
