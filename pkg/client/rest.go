@@ -41,10 +41,6 @@ const defaultAPIBaseURL = "https://api.nanit.com"
 // an error in the log each time, and does not end the program.
 type TemporaryError struct {
 	Err error
-
-	// Status - HTTP status of the answer, when the failure is an answer
-	// of the server. 0 when no answer has arrived.
-	Status int
 }
 
 func (e *TemporaryError) Error() string { return e.Err.Error() }
@@ -67,7 +63,7 @@ func statusError(what string, code int) error {
 	err := fmt.Errorf("%v: server responded with status code %v", what, code)
 
 	if code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
-		return &TemporaryError{Err: err, Status: code}
+		return &TemporaryError{Err: err}
 	}
 
 	return err
@@ -211,25 +207,35 @@ func (c *NanitClient) hasFreshToken() bool {
 	return current.AuthToken != "" && time.Since(current.AuthTime) <= AuthTokenTimelife
 }
 
-// AuthorizeForAttempt - authorization before an attempt to connect.
-//
-// A caller sets renew when its attempt before this one failed: the token
-// may have been the cause, so a new one is asked for although the token
-// of the session should still be valid. That renewal is a precaution. If
-// the server answers it with an error of its own (5xx, 408, 429), the
-// network works and the token of the session may well be good, so the
-// caller goes on with that token. Without this, a renewal service that is
-// down would keep every camera from connecting for as long as it is down.
-func (c *NanitClient) AuthorizeForAttempt(renew bool) error {
-	err := c.MaybeAuthorize(renew)
+// refusedTokenMinAge - a token that the server refuses is replaced only
+// when it is at least this old. A token that is refused right after it
+// was issued is not refused for its age, and one more renewal would not
+// help: it would only use up one more refresh token. This also limits
+// the renewals when the server refuses every token, to one in this time.
+// A token is assumed to be good for AuthTokenTimelife, so the server
+// should not refuse one that is younger than this at all.
+const refusedTokenMinAge = 30 * time.Minute
 
-	var temporary *TemporaryError
-	if renew && errors.As(err, &temporary) && temporary.Status != 0 && c.hasFreshToken() {
-		log.Warn().Err(err).Msg("Unable to renew the auth token. Going on with the token of the session, which should still be valid")
+// RenewRefusedToken gets a new auth token in the place of refused, which
+// the server did not accept. It does nothing when the session holds
+// another token by now, or when the token is too young to be the cause
+// (see refusedTokenMinAge).
+func (c *NanitClient) RenewRefusedToken(refused string) error {
+	// The token and the count belong together: an authorization that
+	// ends after this point is seen by authorizeAfter, which then makes
+	// no further one.
+	token, seen := c.tokenForRequest()
+
+	if token != refused {
 		return nil
 	}
 
-	return err
+	if age := time.Since(c.SessionStore.Snapshot().AuthTime); age < refusedTokenMinAge {
+		log.Debug().Str("age", age.String()).Msg("The server has refused a token that is new. It is not renewed again yet")
+		return nil
+	}
+
+	return c.authorizeAfter(seen)
 }
 
 // authorizeAfter performs an authorization. If one has ended since the

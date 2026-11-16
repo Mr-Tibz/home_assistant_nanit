@@ -372,38 +372,23 @@ func TestAuthorizeLogsInWhenTheConfiguredRefreshTokenIsRefusedToo(t *testing.T) 
 	assert.Equal(t, "access-login", c.AuthToken())
 }
 
-// The renewal before a new attempt to connect is a precaution. If the
-// server answers it with an error of its own, the caller goes on with the
-// token of the session, as long as that token should still be valid.
-func TestAuthorizeForAttempt(t *testing.T) {
-	for name, tc := range map[string]struct {
-		renew     bool
-		fresh     bool
-		breakIt   func(api *fakeAPI)
-		wantError bool
-	}{
-		"server error, fresh token":      {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, false},
-		"too many requests, fresh token": {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusTooManyRequests }, false},
-		"server error, old token":        {true, false, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, true},
-		"no answer, fresh token":         {true, true, func(api *fakeAPI) { api.server.Close() }, true},
-		"refusal, fresh token":           {true, true, func(api *fakeAPI) { api.refreshStatus = http.StatusBadRequest }, true},
-		"renewal works":                  {true, true, func(api *fakeAPI) {}, false},
-		"no renewal asked, old token":    {false, false, func(api *fakeAPI) { api.refreshStatus = http.StatusServiceUnavailable }, true},
-		"no renewal asked, fresh token":  {false, true, func(api *fakeAPI) { api.server.Close() }, false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			api := newFakeAPI(t)
-			c := newTestClient(t, api)
-			if tc.fresh {
-				c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now() })
-			}
-			tc.breakIt(api)
+// A token that the server has refused is replaced, unless the session
+// holds another token by now, or the token is too new to be the cause.
+func TestRenewRefusedToken(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
 
-			err := c.AuthorizeForAttempt(tc.renew)
+	c.SessionStore.Update(func(s *session.Session) { s.AuthTime = time.Now().Add(-refusedTokenMinAge - 5*time.Minute) })
 
-			assert.Equal(t, tc.wantError, err != nil, "got: %v", err)
-		})
-	}
+	require.NoError(t, c.RenewRefusedToken("an-older-token"))
+	assert.EqualValues(t, 0, atomic.LoadInt32(&api.refreshCalls), "the session has moved on from the refused token")
+
+	require.NoError(t, c.RenewRefusedToken("access-1"))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls))
+	assert.Equal(t, "access-2", c.AuthToken())
+
+	require.NoError(t, c.RenewRefusedToken("access-2"))
+	assert.EqualValues(t, 1, atomic.LoadInt32(&api.refreshCalls), "a token that is refused when new is not the cause")
 }
 
 // The answer to a login normally carries a new refresh token. If it does

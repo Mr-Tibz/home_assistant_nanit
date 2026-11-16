@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"time"
 
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
@@ -13,14 +14,25 @@ func processSensorData(babyUID string, sensorData []*client.SensorData, stateMan
 	// Parse sensor update
 	stateUpdate := baby.State{}
 	for _, sensorDataSet := range sensorData {
-		if *sensorDataSet.SensorType == client.SensorType_TEMPERATURE {
-			stateUpdate.SetTemperatureMilli(*sensorDataSet.ValueMilli)
+		// A reading without its type or its value is left out. Reading
+		// such a field without a check ended the program.
+		if sensorDataSet.SensorType == nil {
+			continue
 		}
-		if *sensorDataSet.SensorType == client.SensorType_HUMIDITY {
-			stateUpdate.SetHumidityMilli(*sensorDataSet.ValueMilli)
-		}
-		if *sensorDataSet.SensorType == client.SensorType_NIGHT {
-			stateUpdate.SetIsNight(*sensorDataSet.Value == 1)
+
+		switch *sensorDataSet.SensorType {
+		case client.SensorType_TEMPERATURE:
+			if sensorDataSet.ValueMilli != nil {
+				stateUpdate.SetTemperatureMilli(*sensorDataSet.ValueMilli)
+			}
+		case client.SensorType_HUMIDITY:
+			if sensorDataSet.ValueMilli != nil {
+				stateUpdate.SetHumidityMilli(*sensorDataSet.ValueMilli)
+			}
+		case client.SensorType_NIGHT:
+			if sensorDataSet.Value != nil {
+				stateUpdate.SetIsNight(*sensorDataSet.Value == 1)
+			}
 		}
 	}
 
@@ -49,13 +61,19 @@ func requestLocalStreaming(babyUID string, targetURL string, streamingStatus cli
 
 		_, err := awaitResponse(30 * time.Second)
 
+		if errors.Is(err, client.ErrConnectionClosed) {
+			// The connection has ended, so this says nothing about the
+			// stream. The handlers of the next connection ask again.
+			return
+		}
+
 		if err != nil {
 			if err.Error() == "Forbidden: Number of Mobile App connections above limit, declining connection" {
 				log.Warn().Err(err).Msg("Too many app connections, waiting for local connection to become available...")
 				stateManager.Update(babyUID, *baby.NewState().SetStreamRequestState(baby.StreamRequestState_RequestFailed))
 				time.Sleep(300 * time.Second)
 				continue
-			} else if err.Error() != "Request timeout" {
+			} else if !errors.Is(err, client.ErrRequestTimeout) {
 				if stateManager.GetBabyState(babyUID).GetStreamState() == baby.StreamState_Alive {
 					log.Info().Err(err).Msg("Failed to request local streaming, but stream seems to be alive from previous run")
 				} else if stateManager.GetBabyState(babyUID).GetStreamState() == baby.StreamState_Unhealthy {

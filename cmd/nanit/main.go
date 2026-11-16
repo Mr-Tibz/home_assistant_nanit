@@ -8,9 +8,42 @@ import (
 
 	"github.com/rs/zerolog/log"
 	"github.com/indiefan/home_assistant_nanit/pkg/app"
+	"github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/indiefan/home_assistant_nanit/pkg/mqtt"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 )
+
+// websocketOpts reads the settings of the websocket connection to the
+// camera.
+func websocketOpts() app.WebsocketOpts {
+	opts := app.WebsocketOpts{
+		PingInterval: utils.EnvVarSeconds("NANIT_WS_PING_INTERVAL", client.DefaultPingInterval),
+	}
+
+	if opts.PingInterval <= 0 {
+		log.Fatal().Msg("Invalid NANIT_WS_PING_INTERVAL. It must be 1 or more.")
+	}
+
+	// Without the setting, the idle limit stays at zero, and the client
+	// works out a default that fits the ping interval
+	if _, found := os.LookupEnv("NANIT_WS_IDLE_TIMEOUT"); !found {
+		return opts
+	}
+
+	opts.IdleTimeout = utils.EnvVarSeconds("NANIT_WS_IDLE_TIMEOUT", 0)
+
+	if opts.IdleTimeout == 0 {
+		// 0 turns the idle limit off. In the options, a negative value
+		// says so, because 0 stands for the default there.
+		opts.IdleTimeout = -1
+	} else if opts.IdleTimeout < 2*opts.PingInterval {
+		// With less than two intervals, one answer to a ping that is
+		// late would end a connection that works
+		log.Fatal().Msgf("NANIT_WS_IDLE_TIMEOUT (%v) must be at least two times NANIT_WS_PING_INTERVAL (%v), or 0 to turn the limit off", opts.IdleTimeout, opts.PingInterval)
+	}
+
+	return opts
+}
 
 func main() {
 	initLogger()
@@ -35,6 +68,7 @@ func main() {
 			// 300 second (5 min) default message timeout (unseen messages are ignored once they are this old)
 			MessageTimeout: utils.EnvVarSeconds("NANIT_EVENTS_MESSAGE_TIMEOUT", 300*time.Second),
 		},
+		Websocket: websocketOpts(),
 	}
 
 	if utils.EnvVarBool("NANIT_RTMP_ENABLED", true) {
