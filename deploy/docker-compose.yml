@@ -8,17 +8,15 @@
 #
 # The folder behind NANIT_DATA_PATH holds session.json, which is the
 # sign-in to Nanit. Keep that folder, and no new sign-in is needed after
-# an update. See the README for how to make the file.
+# an update. docs/docker-compose.md says how to make the file.
 #
-# Settings, as environment variables of the deployment:
+# Settings, as environment variables of the deployment (for example in the
+# file .env next to this file):
 #
-#   NANIT_RTMP_ADDR    required. The address of this machine that the camera
-#                      can reach, with the port, for example 192.168.1.10:1935
+#   NANIT_RTMP_HOST    required. The address of this machine that the camera
+#                      can reach, without a port, for example 192.168.1.10
 #   NANIT_DATA_PATH    required. The folder on this machine for session.json
-#   NANIT_RTMP_PORT    the port for the stream (default 1935). It must be
-#                      the port in NANIT_RTMP_ADDR: the program listens on
-#                      that port.
-#   NANIT_LOG_LEVEL    default info
+#   NANIT_RTMP_PORT    the port for the stream (default 1935)
 #   NANIT_NETWORK      the name of the Docker network of the container
 #                      (default nanit)
 #   NANIT_NETWORK_EXTERNAL
@@ -28,6 +26,9 @@
 #                      the port for the stream.
 #   NANIT_REVISION     what the program logs as its version at the start,
 #                      for example the commit that is deployed (default: none)
+#
+# Every other setting of .env.sample is passed on to the program when it
+# is set, see the list under "environment" below.
 
 name: nanit
 
@@ -49,13 +50,32 @@ services:
     # time for that, with some room to the moment the container is killed.
     stop_grace_period: 30s
 
+    # The program listens on the port that it gives the camera, so the
+    # same number is used on both sides and in the address below
     ports:
       - "${NANIT_RTMP_PORT:-1935}:${NANIT_RTMP_PORT:-1935}"
 
     environment:
-      NANIT_RTMP_ADDR: "${NANIT_RTMP_ADDR:?Set NANIT_RTMP_ADDR to the address of this machine that the camera can reach, with the port, for example 192.168.1.10:1935}"
-      NANIT_LOG_LEVEL: "${NANIT_LOG_LEVEL:-info}"
-      NANIT_SHUTDOWN_TIMEOUT: "25"
+      - "NANIT_RTMP_ADDR=${NANIT_RTMP_HOST:?Set NANIT_RTMP_HOST to the address of this machine that the camera can reach, without a port, for example 192.168.1.10}:${NANIT_RTMP_PORT:-1935}"
+      - "NANIT_SHUTDOWN_TIMEOUT=${NANIT_SHUTDOWN_TIMEOUT:-25}"
+
+      # Passed on when they are set, see .env.sample for what they do
+      - NANIT_LOG_LEVEL
+      - NANIT_EMAIL
+      - NANIT_PASSWORD
+      - NANIT_REFRESH_TOKEN
+      - NANIT_RTMP_READ_TIMEOUT
+      - NANIT_WS_PING_INTERVAL
+      - NANIT_WS_IDLE_TIMEOUT
+      - NANIT_MQTT_ENABLED
+      - NANIT_MQTT_BROKER_URL
+      - NANIT_MQTT_CLIENT_ID
+      - NANIT_MQTT_USERNAME
+      - NANIT_MQTT_PASSWORD
+      - NANIT_MQTT_PREFIX
+      - NANIT_EVENTS_POLLING
+      - NANIT_EVENTS_POLLING_INTERVAL
+      - NANIT_EVENTS_MESSAGE_TIMEOUT
 
     volumes:
       - "${NANIT_DATA_PATH:?Set NANIT_DATA_PATH to the folder on this machine that holds session.json}:/data"

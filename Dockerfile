@@ -1,18 +1,25 @@
-# The Go version here is the one that CI runs the tests with, see
-# .github/workflows/ci.yml
-FROM --platform=$BUILDPLATFORM golang:1.27 AS build
+# The Go version that builds the program. CI runs the tests with this
+# version too, and checks that the two are the same.
+ARG GO_VERSION=1.27
+
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS build
 WORKDIR /app
 
-# The modules first, so that a change of the source does not fetch them again
+# The modules first, so that a change of the source does not fetch them
+# again. The builder keeps the two caches between builds, so a change of
+# the source compiles only what has changed.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY cmd ./cmd
 COPY pkg ./pkg
 
 ARG CI_COMMIT_SHORT_SHA
 ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X main.GitCommit=$CI_COMMIT_SHORT_SHA" -o ./bin/nanit ./cmd/nanit/
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X main.GitCommit=$CI_COMMIT_SHORT_SHA" -o ./bin/nanit ./cmd/nanit/
 
 FROM debian:trixie-slim
 
