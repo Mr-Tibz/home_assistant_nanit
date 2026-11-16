@@ -6,9 +6,23 @@ import (
 	"sync"
 	"time"
 
+	"github.com/notedit/rtmp/av"
 	"github.com/notedit/rtmp/format/rtmp"
 	"github.com/rs/zerolog/log"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
+)
+
+const (
+	// publisherReadTimeout - a publisher that sends nothing for this
+	// long has ended. A stream can stop without a sign, for example when
+	// the camera loses its network. Without this limit such a stream
+	// counted as running for ever, and nothing asked the camera for a
+	// new one.
+	publisherReadTimeout = 10 * time.Second
+
+	// subscriberWriteTimeout - time limit for writing one packet to a
+	// subscriber
+	subscriberWriteTimeout = 10 * time.Second
 )
 
 type rtmpHandler struct {
@@ -64,46 +78,75 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 
 	if c.Publishing {
 		sublog.Info().Msg("New stream publisher connected")
-		publisher := s.getNewPublisher(babyUID)
+		publisher := s.getNewPublisher(babyUID, func() { nc.Close() })
 
-		for {
-			pkt, err := c.ReadPacket()
-			if err != nil {
-				sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
-				s.closePublisher(babyUID, publisher)
+		err := readPackets(c, nc, publisher, publisherReadTimeout)
+
+		sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
+		s.closePublisher(babyUID, publisher)
+		nc.Close()
+
+		return
+	}
+
+	sublog.Debug().Msg("New stream subscriber connected")
+	subscriber, unsubscribe := s.getNewSubscriber(babyUID)
+
+	if subscriber == nil {
+		sublog.Warn().Msg("No stream publisher registered yet, closing subscriber stream")
+		nc.Close()
+		return
+	}
+
+	defer nc.Close()
+	defer unsubscribe()
+
+	closeC := c.CloseNotify()
+
+	for {
+		select {
+		case pkt, open := <-subscriber.pktC:
+			if !open {
+				sublog.Debug().Msg("Closing subscriber because the publisher quit or the subscriber was too slow")
 				return
 			}
 
-			publisher.broadcast(pkt)
-		}
+			nc.SetWriteDeadline(time.Now().Add(subscriberWriteTimeout))
+			if err := c.WritePacket(pkt); err != nil {
+				sublog.Debug().Err(err).Msg("Unable to write to stream subscriber, closing it")
+				return
+			}
 
-	} else {
-		sublog.Debug().Msg("New stream subscriber connected")
-		subscriber, unsubscribe := s.getNewSubscriber(babyUID)
-
-		if subscriber == nil {
-			sublog.Warn().Msg("No stream publisher registered yet, closing subscriber stream")
-			nc.Close()
+		case <-closeC:
+			sublog.Debug().Msg("Stream subscriber disconnected")
 			return
 		}
+	}
+}
 
-		closeC := c.CloseNotify()
-		for {
-			select {
-			case pkt, open := <-subscriber.pktC:
-				if !open {
-					sublog.Debug().Msg("Closing subscriber because publisher quit")
-					nc.Close()
-					return
-				}
+// packetReader - what readPackets needs of an RTMP connection
+type packetReader interface {
+	ReadPacket() (av.Packet, error)
+}
 
-				c.WritePacket(pkt)
+// readDeadliner - what readPackets needs of the network connection
+type readDeadliner interface {
+	SetReadDeadline(t time.Time) error
+}
 
-			case <-closeC:
-				sublog.Debug().Msg("Stream subscriber disconnected")
-				unsubscribe()
-			}
+// readPackets hands the packets of a publisher to its broadcaster until
+// reading fails, and returns that failure. Reading fails also when no
+// packet has arrived for timeout.
+func readPackets(c packetReader, nc readDeadliner, publisher *broadcaster, timeout time.Duration) error {
+	for {
+		nc.SetReadDeadline(time.Now().Add(timeout))
+
+		pkt, err := c.ReadPacket()
+		if err != nil {
+			return err
 		}
+
+		publisher.broadcast(pkt)
 	}
 }
 
@@ -114,8 +157,13 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 // publishers, here and in closePublisher. A new publisher that comes at
 // the moment an old one ends can therefore not be followed by the state
 // "ended" of the old one.
-func (s *rtmpHandler) getNewPublisher(babyUID string) *broadcaster {
+//
+// stop ends the publisher. It is called when a newer publisher takes its
+// place: the camera has started a new stream, so the old one is of no use
+// any more, and its connection is closed.
+func (s *rtmpHandler) getNewPublisher(babyUID string, stop func()) *broadcaster {
 	broadcaster := newBroadcaster()
+	broadcaster.stop = stop
 
 	s.broadcastersMu.Lock()
 	existingBroadcaster, hadExistingBroadcaster := s.broadcastersByUID[babyUID]
@@ -124,8 +172,12 @@ func (s *rtmpHandler) getNewPublisher(babyUID string) *broadcaster {
 	s.broadcastersMu.Unlock()
 
 	if hadExistingBroadcaster {
-		log.Warn().Msg("Baby already has active publisher, closing existing subscribers")
-		go existingBroadcaster.closeSubscribers()
+		log.Warn().Msg("Baby already has active publisher, closing it and its subscribers")
+		existingBroadcaster.closeSubscribers()
+
+		if existingBroadcaster.stop != nil {
+			existingBroadcaster.stop()
+		}
 	}
 
 	return broadcaster
