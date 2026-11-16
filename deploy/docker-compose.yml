@@ -1,0 +1,95 @@
+# Runs the program from the source of this repository.
+#
+# The image is built on the machine that runs it, from the repository as
+# it is checked out there. No image registry and no sign-in to one is
+# needed. A tool that follows this repository and deploys again when it
+# changes, such as a Portainer stack with automatic updates, then takes
+# new code without any other step.
+#
+# The folder behind NANIT_DATA_PATH holds session.json, which is the
+# sign-in to Nanit. Keep that folder, and no new sign-in is needed after
+# an update. docs/docker-compose.md says how to make the file.
+#
+# Settings, as environment variables of the deployment (for example in the
+# file .env next to this file):
+#
+#   NANIT_RTMP_HOST    required. The address of this machine that the camera
+#                      can reach, without a port, for example 192.168.1.10
+#   NANIT_DATA_PATH    required. The folder on this machine for session.json
+#   NANIT_RTMP_PORT    the port for the stream (default 1935)
+#   NANIT_NETWORK      the name of the Docker network of the container
+#                      (default nanit)
+#   NANIT_NETWORK_EXTERNAL
+#                      true if that network exists already and is not made
+#                      here (default false). A media server on the same
+#                      network reaches the program by the name nanit, on
+#                      the port for the stream.
+#   NANIT_REVISION     what the program logs as its version at the start,
+#                      for example the commit that is deployed (default: none)
+#
+# The other settings of .env.sample are passed on to the program when they
+# are set, see the list under "environment" below. Not in that list are
+# the folder for the data and the place of the session file in the
+# container, and the time for the clean up at a stop, which this file
+# sets to fit stop_grace_period.
+
+name: nanit
+
+services:
+  nanit:
+    build:
+      context: ..
+      args:
+        CI_COMMIT_SHORT_SHA: "${NANIT_REVISION:-}"
+    # Build the image at every deployment, also when one with this name
+    # is there already. Without this, new source would not be used.
+    pull_policy: build
+    image: nanit:from-source
+    container_name: nanit
+    restart: unless-stopped
+
+    # At a stop the program asks the camera to stop its stream, so that
+    # the camera has a free place for the next start at once. Give it the
+    # time for that, with some room to the moment the container is killed.
+    stop_grace_period: 30s
+
+    # The program listens on the port that it gives the camera, so the
+    # same number is used on both sides and in the address below
+    ports:
+      - "${NANIT_RTMP_PORT:-1935}:${NANIT_RTMP_PORT:-1935}"
+
+    environment:
+      - "NANIT_RTMP_ADDR=${NANIT_RTMP_HOST:?Set NANIT_RTMP_HOST to the address of this machine that the camera can reach, without a port, for example 192.168.1.10}:${NANIT_RTMP_PORT:-1935}"
+      # Less than stop_grace_period above, which is the moment the
+      # container is killed
+      - "NANIT_SHUTDOWN_TIMEOUT=25"
+
+      # Passed on when they are set, see .env.sample for what they do
+      - NANIT_LOG_LEVEL
+      - NANIT_RTMP_ENABLED
+      - NANIT_EMAIL
+      - NANIT_PASSWORD
+      - NANIT_REFRESH_TOKEN
+      - NANIT_RTMP_READ_TIMEOUT
+      - NANIT_WS_PING_INTERVAL
+      - NANIT_WS_IDLE_TIMEOUT
+      - NANIT_MQTT_ENABLED
+      - NANIT_MQTT_BROKER_URL
+      - NANIT_MQTT_CLIENT_ID
+      - NANIT_MQTT_USERNAME
+      - NANIT_MQTT_PASSWORD
+      - NANIT_MQTT_PREFIX
+      - NANIT_EVENTS_POLLING
+      - NANIT_EVENTS_POLLING_INTERVAL
+      - NANIT_EVENTS_MESSAGE_TIMEOUT
+
+    volumes:
+      - "${NANIT_DATA_PATH:?Set NANIT_DATA_PATH to the folder on this machine that holds session.json}:/data"
+
+    networks:
+      - nanit
+
+networks:
+  nanit:
+    name: "${NANIT_NETWORK:-nanit}"
+    external: ${NANIT_NETWORK_EXTERNAL:-false}

@@ -47,3 +47,63 @@ docker-compose up -d # creates new container with fresh image (do this after eve
 # Uninstall the app
 docker-compose down
 ```
+
+## Run from the source of this repository
+
+[deploy/docker-compose.yml](../deploy/docker-compose.yml) builds the image on the machine that runs it, from the repository as it is checked out there. No image registry and no sign-in to one is needed.
+
+```bash
+git clone https://github.com/Mr-Tibz/home_assistant_nanit.git
+cd home_assistant_nanit
+```
+
+Put the two settings that are needed in the file `deploy/.env`. Compose reads that file at every run, and git leaves it alone:
+
+```bash
+# The address of this machine that the camera can reach, without a port
+NANIT_RTMP_HOST=192.168.1.10
+# The folder on this machine for session.json
+NANIT_DATA_PATH=/srv/nanit-data
+```
+
+The other settings of [.env.sample](../.env.sample) can go in the same file. Write a `$` in a value as `$$`, or Compose takes what follows it for the name of a variable. The top of the compose file lists a few more settings that belong to the deployment, for example how to put the container on a Docker network that exists already, so that a media server on that network can read the stream.
+
+Make `session.json`, which is the sign-in to Nanit, with the setup script of the image. It asks for the e-mail address, the password and the code that Nanit sends:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm --no-deps --entrypoint /app/scripts/init-nanit.sh nanit
+```
+
+Start the program:
+
+```bash
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+Keep the folder behind `NANIT_DATA_PATH`, and an update needs no new sign-in. To update, fetch the new source and deploy again. The image is built again each time:
+
+```bash
+git pull
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+Each build leaves the image before it without a name. `docker image prune` removes those.
+
+The base images (Go and Debian) are fetched once and then kept by Docker. To get their newer versions too, run `docker compose -f deploy/docker-compose.yml build --pull` before the `up`.
+
+### Automatic updates with Portainer
+
+A Portainer stack can follow this repository and deploy again when it changes:
+
+1. Stacks, Add stack, Repository.
+2. Repository URL: the address of this repository. Compose path: `deploy/docker-compose.yml`.
+3. Switch on GitOps updates, with polling.
+4. Add the environment variables `NANIT_RTMP_HOST` and `NANIT_DATA_PATH`.
+
+The first deployment builds the image. If the folder behind `NANIT_DATA_PATH` has no `session.json` yet, the program cannot sign in and ends again and again. Make the file on that machine with the image that was just built, and then start the stack again:
+
+```bash
+docker run -it --rm -v /srv/nanit-data:/data --entrypoint /app/scripts/init-nanit.sh nanit:from-source
+```
+
+Each update stops the container for the time of a restart. The program asks the camera to stop its stream first, so the new container gets the stream at once.

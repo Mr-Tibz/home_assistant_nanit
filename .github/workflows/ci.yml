@@ -16,18 +16,29 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The tests run with two versions of Go: the oldest one that the module
+  # allows (go.mod), and the one that builds the image (Dockerfile).
   go:
-    name: Build, vet and test
+    name: Build, vet and test (Go ${{ matrix.go.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - { name: "of go.mod", version: "" }
+          - { name: "of the image", version: "1.27" }
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The version of the matrix, or the one of go.mod when the matrix
+      # gives none
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go.version }}
+          go-version-file: ${{ matrix.go.version == '' && 'go.mod' || '' }}
 
       # Vet and the tests compile every package, test files included.
       - name: Vet
@@ -36,10 +47,10 @@ jobs:
       - name: Test
         run: go test -race -count=1 -timeout 120s ./...
 
-  # The published images are built without cgo for several architectures.
-  # Vet and link for each of them, test files included, so that code which
-  # only builds on one architecture, or only with cgo, is caught here and
-  # not at release time.
+  # The published images are built without cgo for several architectures,
+  # with the Go version of the Dockerfile. Vet and link for each of them,
+  # test files included, so that code which only builds on one
+  # architecture, or only with cgo, is caught here and not at release time.
   cross:
     name: Compile for linux/${{ matrix.arch }}
     runs-on: ubuntu-latest
@@ -59,7 +70,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: "1.27"
           # The cache key of this action does not include the target
           # architecture, so the matrix jobs would overwrite each other's
           # entry and restore the wrong one. These builds are small.
@@ -72,10 +83,82 @@ jobs:
 
       # Link the program the way the Dockerfile does.
       - name: Link the program
-        run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/*.go
+        run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/
 
       # A 386 program runs on the amd64 runner, so the tests can run on a
       # 32-bit target too. The race detector does not exist for 386.
       - name: Test (32-bit)
         if: matrix.arch == '386'
         run: go test -count=1 -timeout 120s ./...
+
+  # The image is what people run. Build it the way a deployment does, with
+  # the compose file, and start the program in it once.
+  image:
+    name: Build the image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NANIT_RTMP_HOST: 192.0.2.1
+      NANIT_DATA_PATH: /tmp/nanit-data
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The tests above must run with the Go version that builds the
+      # image. The version is written in the Dockerfile and in the jobs
+      # above, and this step keeps the places the same.
+      - name: Check the Go version of the image against the one of the tests
+        run: |
+          image_go="$(sed -n 's/^ARG GO_VERSION=//p' Dockerfile)"
+          echo "Dockerfile: $image_go"
+          grep -n 'version: "' .github/workflows/ci.yml
+          test -n "$image_go"
+          test "$(grep -c "version: \"$image_go\"" .github/workflows/ci.yml)" = "2"
+
+      # For a pull request, the commit of the branch and not the commit
+      # that the merge of it would give
+      - name: Build
+        run: NANIT_REVISION="${REVISION::7}" docker compose -f deploy/docker-compose.yml build
+        env:
+          REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # Without settings the program starts, logs the version that the
+      # build gave it, and stops with the name of the one setting that it
+      # needs.
+      - name: Start the program in the image
+        run: |
+          output="$(docker run --rm nanit:from-source 2>&1 || true)"
+          echo "$output"
+          echo "$output" | grep -q "gitversion=.*${REVISION::7}"
+          echo "$output" | grep -q "Missing environment variable NANIT_RTMP_ADDR"
+        env:
+          REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      # The certificates are for the program: without them it cannot check
+      # the servers of Nanit. The stop test below has no network, so this
+      # is the only step that looks for them.
+      - name: Check the tools of the setup script and the certificates
+        run: docker run --rm --entrypoint bash nanit:from-source -c 'command -v curl && command -v jq && test -x /app/scripts/init-nanit.sh && test -s /etc/ssl/certs/ca-certificates.crt'
+
+      # A container gets SIGTERM when it is stopped. The program must end
+      # in order then, and well within the time that a container gets.
+      - name: Stop the program in a container
+        run: |
+          # The revision of the session format, as the program has it
+          revision="$(sed -n 's/^const Revision = //p' pkg/session/session.go)"
+          test -n "$revision"
+
+          mkdir -p "$RUNNER_TEMP/data"
+          printf '{"revision":%s,"authToken":"x","authTime":"%s","babies":[{"uid":"b1","name":"B","camera_uid":"c1"}],"refreshToken":"r"}' "$revision" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RUNNER_TEMP/data/session.json"
+
+          # No network: the program must not reach the real service with
+          # the made-up session of this test
+          docker run -d --name stop-test --network none -e NANIT_RTMP_ADDR=127.0.0.1:1935 -v "$RUNNER_TEMP/data:/data" nanit:from-source
+          sleep 5
+
+          docker stop -t 10 stop-test
+          docker logs stop-test
+
+          test "$(docker inspect stop-test --format '{{.State.ExitCode}}')" = "0"
+          docker logs stop-test 2>&1 | grep -q "Loaded app session from the file"
+          docker logs stop-test 2>&1 | grep -q "Clean exit"
