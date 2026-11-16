@@ -1,6 +1,7 @@
 package rtmpserver
 
 import (
+	"io"
 	"net"
 	"regexp"
 	"sync"
@@ -12,27 +13,36 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 )
 
-const (
-	// publisherReadTimeout - a publisher that sends nothing for this
-	// long has ended. A stream can stop without a sign, for example when
-	// the camera loses its network. Without this limit such a stream
-	// counted as running for ever, and nothing asked the camera for a
-	// new one.
-	publisherReadTimeout = 10 * time.Second
+// DefaultReadTimeout - a publisher from which no packet has arrived for
+// this long has ended. A stream can stop without a sign, for example when
+// the camera loses its network for good. Without a limit such a stream
+// counted as running for ever, and nothing asked the camera for a new
+// one.
+//
+// The limit is long on purpose. A gap of the network that is shorter
+// passes without any loss but a picture that stands still, because the
+// connection goes on after it. Ending the stream means asking the camera
+// for a new one, and that request can be refused.
+const DefaultReadTimeout = 30 * time.Second
 
-	// subscriberWriteTimeout - time limit for writing one packet to a
-	// subscriber
-	subscriberWriteTimeout = 10 * time.Second
-)
+// subscriberWriteTimeout - time limit for writing one packet to a
+// subscriber
+const subscriberWriteTimeout = 10 * time.Second
 
 type rtmpHandler struct {
+	// readTimeout - see DefaultReadTimeout. 0 means no limit.
+	readTimeout time.Duration
+
 	babyStateManager  *baby.StateManager
 	broadcastersMu    sync.RWMutex
 	broadcastersByUID map[string]*broadcaster
 }
 
 // StartRTMPServer - Blocking server
-func StartRTMPServer(addr string, babyStateManager *baby.StateManager) {
+//
+// readTimeout ends a publisher from which no packet arrives, see
+// DefaultReadTimeout. 0 means no limit.
+func StartRTMPServer(addr string, babyStateManager *baby.StateManager, readTimeout time.Duration) {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatal().Str("addr", addr).Err(err).Msg("Unable to start RTMP server")
@@ -42,7 +52,9 @@ func StartRTMPServer(addr string, babyStateManager *baby.StateManager) {
 	log.Info().Str("addr", addr).Msg("RTMP server started")
 
 	s := rtmp.NewServer()
-	s.HandleConn = newRtmpHandler(babyStateManager).handleConnection
+	handler := newRtmpHandler(babyStateManager)
+	handler.readTimeout = readTimeout
+	s.HandleConn = handler.handleConnection
 
 	for {
 		nc, err := lis.Accept()
@@ -78,12 +90,16 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 
 	if c.Publishing {
 		sublog.Info().Msg("New stream publisher connected")
-		publisher := s.getNewPublisher(babyUID, func() { nc.Close() })
+		publisher := s.getNewPublisher(babyUID, nc)
 
-		err := readPackets(c, nc, publisher, publisherReadTimeout)
+		err := readPackets(c, nc, publisher, s.readTimeout)
 
-		sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
-		s.closePublisher(babyUID, publisher)
+		if s.closePublisher(babyUID, publisher) {
+			sublog.Warn().Err(err).Msg("Publisher stream closed unexpectedly")
+		} else {
+			sublog.Info().Msg("Publisher stream closed, because a newer publisher has taken its place")
+		}
+
 		nc.Close()
 
 		return
@@ -124,22 +140,20 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 	}
 }
 
-// packetReader - what readPackets needs of an RTMP connection
-type packetReader interface {
-	ReadPacket() (av.Packet, error)
-}
-
 // readDeadliner - what readPackets needs of the network connection
 type readDeadliner interface {
 	SetReadDeadline(t time.Time) error
 }
 
 // readPackets hands the packets of a publisher to its broadcaster until
-// reading fails, and returns that failure. Reading fails also when no
-// packet has arrived for timeout.
-func readPackets(c packetReader, nc readDeadliner, publisher *broadcaster, timeout time.Duration) error {
+// reading fails, and returns that failure. With a timeout, reading fails
+// also when no packet has arrived for that long. The time limit starts
+// again with every packet.
+func readPackets(c av.PacketReader, nc readDeadliner, publisher *broadcaster, timeout time.Duration) error {
 	for {
-		nc.SetReadDeadline(time.Now().Add(timeout))
+		if timeout > 0 {
+			nc.SetReadDeadline(time.Now().Add(timeout))
+		}
 
 		pkt, err := c.ReadPacket()
 		if err != nil {
@@ -158,12 +172,11 @@ func readPackets(c packetReader, nc readDeadliner, publisher *broadcaster, timeo
 // the moment an old one ends can therefore not be followed by the state
 // "ended" of the old one.
 //
-// stop ends the publisher. It is called when a newer publisher takes its
-// place: the camera has started a new stream, so the old one is of no use
-// any more, and its connection is closed.
-func (s *rtmpHandler) getNewPublisher(babyUID string, stop func()) *broadcaster {
-	broadcaster := newBroadcaster()
-	broadcaster.stop = stop
+// conn is the connection of the publisher. It is closed when a newer
+// publisher takes its place: the camera has started a new stream then,
+// and the old one is of no use any more.
+func (s *rtmpHandler) getNewPublisher(babyUID string, conn io.Closer) *broadcaster {
+	broadcaster := newBroadcaster(conn)
 
 	s.broadcastersMu.Lock()
 	existingBroadcaster, hadExistingBroadcaster := s.broadcastersByUID[babyUID]
@@ -174,10 +187,7 @@ func (s *rtmpHandler) getNewPublisher(babyUID string, stop func()) *broadcaster 
 	if hadExistingBroadcaster {
 		log.Warn().Msg("Baby already has active publisher, closing it and its subscribers")
 		existingBroadcaster.closeSubscribers()
-
-		if existingBroadcaster.stop != nil {
-			existingBroadcaster.stop()
-		}
+		existingBroadcaster.publisher.Close()
 	}
 
 	return broadcaster
@@ -198,16 +208,20 @@ func (s *rtmpHandler) getNewSubscriber(babyUID string) (*subscriber, func()) {
 }
 
 // closePublisher ends the publisher b. If b was the publisher of the baby
-// at that moment, the stream is marked as ended. A publisher that a newer
-// one has replaced says nothing about the stream when it ends: the newer
-// one sends it.
-func (s *rtmpHandler) closePublisher(babyUID string, b *broadcaster) {
+// at that moment, the stream is marked as ended, and the result is true.
+// A publisher that a newer one has replaced says nothing about the stream
+// when it ends: the newer one sends it.
+func (s *rtmpHandler) closePublisher(babyUID string, b *broadcaster) bool {
 	s.broadcastersMu.Lock()
-	if currBroadcaster, hasExistingBroadcaster := s.broadcastersByUID[babyUID]; hasExistingBroadcaster && currBroadcaster == b {
+	currBroadcaster, hasExistingBroadcaster := s.broadcastersByUID[babyUID]
+	wasCurrent := hasExistingBroadcaster && currBroadcaster == b
+	if wasCurrent {
 		delete(s.broadcastersByUID, babyUID)
 		s.babyStateManager.Update(babyUID, *baby.NewState().SetStreamState(baby.StreamState_Unhealthy))
 	}
 	s.broadcastersMu.Unlock()
 
 	b.closeSubscribers()
+
+	return wasCurrent
 }

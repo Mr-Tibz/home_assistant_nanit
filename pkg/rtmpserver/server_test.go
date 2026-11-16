@@ -12,6 +12,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// fakeConn is a stand-in for the connection of a publisher.
+type fakeConn struct {
+	mu     sync.Mutex
+	closed int
+}
+
+func (conn *fakeConn) Close() error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	conn.closed++
+
+	return nil
+}
+
+func (conn *fakeConn) timesClosed() int {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+
+	return conn.closed
+}
+
 func video(n int) av.Packet {
 	return av.Packet{Type: av.H264, Time: time.Duration(n) * time.Millisecond}
 }
@@ -54,7 +76,7 @@ func isClosed(sub *subscriber) bool {
 // when it joins while the stream runs. Of each kind of header packet it
 // gets the newest one.
 func TestBroadcasterSendsTheHeadersFirst(t *testing.T) {
-	b := newBroadcaster()
+	b := newBroadcaster(&fakeConn{})
 
 	b.broadcast(header(av.H264DecoderConfig, 1))
 	b.broadcast(header(av.AACDecoderConfig, 2))
@@ -78,12 +100,45 @@ func TestBroadcasterSendsTheHeadersFirst(t *testing.T) {
 	assert.Len(t, b.headerPkts, 2, "the list of header packets does not grow")
 }
 
+// A header packet that comes while the stream runs goes to the viewers
+// that are there too: the pictures after it are made for it.
+func TestBroadcasterSendsANewHeaderToItsSubscribers(t *testing.T) {
+	b := newBroadcaster(&fakeConn{})
+
+	b.broadcast(header(av.H264DecoderConfig, 1))
+
+	sub := b.newSubscriber()
+
+	b.broadcast(video(2))
+	b.broadcast(header(av.H264DecoderConfig, 3))
+	b.broadcast(video(4))
+
+	assert.Equal(t, []av.Packet{
+		header(av.H264DecoderConfig, 1),
+		video(2),
+		header(av.H264DecoderConfig, 3),
+		video(4),
+	}, take(sub))
+}
+
+// Sound in the Opus format is sound, not a header. The old rule took every
+// packet type above 2 for a header, and Opus is 3.
+func TestWhichPacketsAreHeaders(t *testing.T) {
+	for _, packetType := range []int{av.H264DecoderConfig, av.H264SPSPPSNALU, av.AACDecoderConfig, av.Metadata} {
+		assert.True(t, isHeader(av.Packet{Type: packetType}), av.PacketTypeString[packetType])
+	}
+
+	for _, packetType := range []int{av.H264, av.AAC, av.OPUS} {
+		assert.False(t, isHeader(av.Packet{Type: packetType}), av.PacketTypeString[packetType])
+	}
+}
+
 // A subscriber that does not take its packets is dropped. The publisher
 // is not held up, and the other subscribers get every packet. Before, the
 // publisher waited for the slowest subscriber, and the stream stopped for
 // all.
 func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
-	b := newBroadcaster()
+	b := newBroadcaster(&fakeConn{})
 
 	slow := b.newSubscriber()
 	fast := b.newSubscriber()
@@ -119,7 +174,10 @@ func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
 		t.Fatal("the publisher was held up")
 	}
 
-	assert.True(t, isClosed(slow), "the slow subscriber was dropped")
+	// A subscriber that is dropped sees that at once. The packets that
+	// waited for it are thrown away.
+	_, open := <-slow.pktC
+	assert.False(t, open, "the slow subscriber was dropped, and nothing waits for it")
 
 	b.closeSubscribers()
 	<-finished
@@ -132,7 +190,7 @@ func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
 // channel of a subscriber twice, or handing a packet to a closed one,
 // ended the program.
 func TestBroadcasterCanBeClosedFromEverySide(t *testing.T) {
-	b := newBroadcaster()
+	b := newBroadcaster(&fakeConn{})
 
 	subs := make([]*subscriber, 16)
 	for i := range subs {
@@ -181,23 +239,40 @@ func TestBroadcasterCanBeClosedFromEverySide(t *testing.T) {
 }
 
 // fakePublisher is a stand-in for the connection of a publisher. It sends
-// a number of packets and then nothing more, without closing.
+// a number of packets, one every interval, and then nothing more, without
+// closing.
 type fakePublisher struct {
 	packets  int
-	deadline time.Time
+	interval time.Duration
+
+	deadline  time.Time
+	deadlines int
 }
 
 var errTimeout = errors.New("i/o timeout")
 
 func (publisher *fakePublisher) SetReadDeadline(t time.Time) error {
 	publisher.deadline = t
+	publisher.deadlines++
+
 	return nil
 }
 
 func (publisher *fakePublisher) ReadPacket() (av.Packet, error) {
 	if publisher.packets > 0 {
+		time.Sleep(publisher.interval)
+
+		if !publisher.deadline.IsZero() && time.Now().After(publisher.deadline) {
+			return av.Packet{}, errTimeout
+		}
+
 		publisher.packets--
+
 		return video(publisher.packets), nil
+	}
+
+	if publisher.deadline.IsZero() {
+		return av.Packet{}, errors.New("the test ends a publisher without a time limit here")
 	}
 
 	// Nothing arrives any more: the read ends at its deadline
@@ -209,13 +284,16 @@ func (publisher *fakePublisher) ReadPacket() (av.Packet, error) {
 // A stream can stop without a sign, for example when the camera loses its
 // network. The read then ends at its time limit. Without a limit the
 // stream counted as running for ever.
+//
+// The limit is for the time without a packet, not for the stream as a
+// whole: the packets here take longer together than the limit.
 func TestReadPacketsEndsWhenThePublisherSendsNothing(t *testing.T) {
-	publisher := &fakePublisher{packets: 5}
-	b := newBroadcaster()
+	publisher := &fakePublisher{packets: 10, interval: 20 * time.Millisecond}
+	b := newBroadcaster(&fakeConn{})
 	sub := b.newSubscriber()
 
 	result := make(chan error, 1)
-	go func() { result <- readPackets(publisher, publisher, b, 50*time.Millisecond) }()
+	go func() { result <- readPackets(publisher, publisher, b, 100*time.Millisecond) }()
 
 	select {
 	case err := <-result:
@@ -224,7 +302,17 @@ func TestReadPacketsEndsWhenThePublisherSendsNothing(t *testing.T) {
 		t.Fatal("reading did not end")
 	}
 
-	assert.Len(t, take(sub), 5, "the packets before the silence were handed on")
+	assert.Len(t, take(sub), 10, "every packet before the silence was handed on")
+	assert.Equal(t, 11, publisher.deadlines, "the time limit started again with every packet")
+}
+
+// Without a time limit, no deadline is set.
+func TestReadPacketsWithoutATimeLimit(t *testing.T) {
+	publisher := &fakePublisher{packets: 3}
+	b := newBroadcaster(&fakeConn{})
+
+	assert.Error(t, readPackets(publisher, publisher, b, 0))
+	assert.Equal(t, 0, publisher.deadlines)
 }
 
 // When the camera starts a new stream, the old one ends a moment later.
@@ -236,19 +324,19 @@ func TestOnlyTheEndOfTheCurrentPublisherEndsTheStream(t *testing.T) {
 
 	streamState := func() baby.StreamState { return states.GetBabyState("baby-1").GetStreamState() }
 
-	older := handler.getNewPublisher("baby-1", nil)
+	older := handler.getNewPublisher("baby-1", &fakeConn{})
 	assert.Equal(t, baby.StreamState_Alive, streamState())
 
-	newer := handler.getNewPublisher("baby-1", nil)
+	newer := handler.getNewPublisher("baby-1", &fakeConn{})
 
-	handler.closePublisher("baby-1", older)
+	assert.False(t, handler.closePublisher("baby-1", older))
 	assert.Equal(t, baby.StreamState_Alive, streamState(), "a newer publisher has replaced it")
 
-	handler.closePublisher("baby-1", newer)
+	assert.True(t, handler.closePublisher("baby-1", newer))
 	assert.Equal(t, baby.StreamState_Unhealthy, streamState())
 
 	// A publisher that comes after the end of the last one
-	again := handler.getNewPublisher("baby-1", nil)
+	again := handler.getNewPublisher("baby-1", &fakeConn{})
 	handler.closePublisher("baby-1", newer)
 	assert.Equal(t, baby.StreamState_Alive, streamState(), "the end of a publisher that is gone already changes nothing")
 
@@ -262,15 +350,17 @@ func TestOnlyTheEndOfTheCurrentPublisherEndsTheStream(t *testing.T) {
 func TestANewPublisherEndsTheOlderOne(t *testing.T) {
 	handler := newRtmpHandler(baby.NewStateManager())
 
-	stopped := 0
-	older := handler.getNewPublisher("baby-1", func() { stopped++ })
+	olderConn := &fakeConn{}
+	older := handler.getNewPublisher("baby-1", olderConn)
 
 	sub, unsubscribe := handler.getNewSubscriber("baby-1")
 	require.NotNil(t, sub)
 
-	handler.getNewPublisher("baby-1", nil)
+	newerConn := &fakeConn{}
+	handler.getNewPublisher("baby-1", newerConn)
 
-	assert.Equal(t, 1, stopped, "the connection of the older publisher is closed")
+	assert.Equal(t, 1, olderConn.timesClosed(), "the connection of the older publisher is closed")
+	assert.Equal(t, 0, newerConn.timesClosed())
 	assert.True(t, isClosed(sub), "its subscriber is closed")
 
 	// The older publisher ends now, and its subscriber leaves. Both
