@@ -16,17 +16,27 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The tests run with two versions of Go: the oldest one that the module
+  # allows (go.mod), and the one that builds the image (Dockerfile).
   go:
-    name: Build, vet and test
+    name: Build, vet and test (Go ${{ matrix.go.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - { name: "of go.mod", version: "" }
+          - { name: "of the image", version: "1.27" }
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # A version that is given takes the place of the one in go.mod
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
+          go-version: ${{ matrix.go.version }}
           go-version-file: go.mod
 
       # Vet and the tests compile every package, test files included.
@@ -72,7 +82,7 @@ jobs:
 
       # Link the program the way the Dockerfile does.
       - name: Link the program
-        run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/*.go
+        run: go build -ldflags "-X main.GitCommit=ci" -o /dev/null ./cmd/nanit/
 
       # A 386 program runs on the amd64 runner, so the tests can run on a
       # 32-bit target too. The race detector does not exist for 386.
@@ -90,8 +100,12 @@ jobs:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # For a pull request, the commit of the branch and not the commit
+      # that the merge of it would give
       - name: Build
-        run: docker build --build-arg CI_COMMIT_SHORT_SHA="${GITHUB_SHA::7}" -t nanit:ci .
+        run: docker build --build-arg CI_COMMIT_SHORT_SHA="${REVISION::7}" -t nanit:ci .
+        env:
+          REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Without settings the program starts, and stops with the name of
       # the one setting that it needs.
@@ -101,8 +115,11 @@ jobs:
           echo "$output"
           echo "$output" | grep -q "Missing environment variable NANIT_RTMP_ADDR"
 
-      - name: Check the tools of the setup script
-        run: docker run --rm --entrypoint bash nanit:ci -c 'command -v curl && command -v jq && test -x /app/scripts/init-nanit.sh'
+      # The certificates are for the program: without them it cannot check
+      # the servers of Nanit. The stop test below has no network, so this
+      # is the only step that looks for them.
+      - name: Check the tools of the setup script and the certificates
+        run: docker run --rm --entrypoint bash nanit:ci -c 'command -v curl && command -v jq && test -x /app/scripts/init-nanit.sh && test -s /etc/ssl/certs/ca-certificates.crt'
 
       # A container gets SIGTERM when it is stopped. The program must end
       # in order then, and well within the time that a container gets.

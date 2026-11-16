@@ -1,4 +1,6 @@
-FROM --platform=$BUILDPLATFORM golang:1.24 AS build
+# The Go version here is the one that CI runs the tests with, see
+# .github/workflows/ci.yml
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 WORKDIR /app
 
 # The modules first, so that a change of the source does not fetch them again
@@ -12,7 +14,7 @@ ARG CI_COMMIT_SHORT_SHA
 ARG TARGETOS TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-X main.GitCommit=$CI_COMMIT_SHORT_SHA" -o ./bin/nanit ./cmd/nanit/
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # ca-certificates: the program checks the certificates of the Nanit servers.
 # bash, curl and jq: scripts/init-nanit.sh needs them.

@@ -55,22 +55,37 @@ docker-compose down
 ```bash
 git clone https://github.com/Mr-Tibz/home_assistant_nanit.git
 cd home_assistant_nanit
+```
 
-# The address of this machine that the camera can reach, and the folder for session.json
-export NANIT_RTMP_ADDR=192.168.1.10:1935
-export NANIT_DATA_PATH=/srv/nanit-data
+Put the two settings that are needed in the file `deploy/.env`. Compose reads that file at every run, and git leaves it alone:
 
+```bash
+# The address of this machine that the camera can reach, with the port
+NANIT_RTMP_ADDR=192.168.1.10:1935
+# The folder on this machine for session.json
+NANIT_DATA_PATH=/srv/nanit-data
+```
+
+Make `session.json`, which is the sign-in to Nanit, with the setup script of the image. It asks for the e-mail address, the password and the code that Nanit sends:
+
+```bash
+docker compose -f deploy/docker-compose.yml run --rm --no-deps --entrypoint /app/scripts/init-nanit.sh nanit
+```
+
+Start the program:
+
+```bash
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-The folder behind `NANIT_DATA_PATH` holds `session.json`, which is the sign-in to Nanit (see the [README](../README.md) for how to make it). Keep that folder, and an update needs no new sign-in.
-
-To update, fetch the new source and deploy again. The image is built again each time:
+Keep the folder behind `NANIT_DATA_PATH`, and an update needs no new sign-in. To update, fetch the new source and deploy again. The image is built again each time:
 
 ```bash
 git pull
 docker compose -f deploy/docker-compose.yml up -d
 ```
+
+The base images (Go and Debian) are fetched once and then kept by Docker. To get their newer versions too, run `docker compose -f deploy/docker-compose.yml build --pull` before the `up`.
 
 The top of the compose file lists the other settings, for example how to put the container on a Docker network that exists already, so that a media server on that network can read the stream.
 
