@@ -11,6 +11,7 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/app"
 	"github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/indiefan/home_assistant_nanit/pkg/mqtt"
+	"github.com/indiefan/home_assistant_nanit/pkg/rtmpserver"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 )
 
@@ -89,8 +90,18 @@ func main() {
 		}
 
 		opts.RTMP = &app.RTMPOpts{
-			ListenAddr: m[1],
-			PublicAddr: publicAddr,
+			ListenAddr:  m[1],
+			PublicAddr:  publicAddr,
+			ReadTimeout: utils.EnvVarSeconds("NANIT_RTMP_READ_TIMEOUT", rtmpserver.DefaultReadTimeout),
+		}
+
+		switch {
+		case opts.RTMP.ReadTimeout < 0:
+			log.Fatal().Msg("Invalid NANIT_RTMP_READ_TIMEOUT. It must be 0 or more.")
+		case opts.RTMP.ReadTimeout == 0:
+			// 0 turns the limit off. In the options, a negative value
+			// says so, because 0 stands for the default there.
+			opts.RTMP.ReadTimeout = -1
 		}
 	}
 
