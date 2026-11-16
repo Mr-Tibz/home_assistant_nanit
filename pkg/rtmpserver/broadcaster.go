@@ -1,25 +1,31 @@
 package rtmpserver
 
 import (
+	"bytes"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/notedit/rtmp/av"
 )
 
 // subscriberBuffer - packets that can wait for one subscriber. A
-// subscriber that falls this far behind is dropped, see broadcast. At 30
-// pictures a second, with the sound, this is several seconds.
-const subscriberBuffer = 512
+// subscriber that falls this far behind is dropped, see send.
+//
+// The number is large on purpose. After a gap of its network, the camera
+// can send what it has kept in one go, and a subscriber that is healthy
+// must not be dropped for that. With about 75 packets a second, this is
+// about half a minute.
+const subscriberBuffer = 2048
 
 type subscriber struct {
-	// initialized - the header packets were sent. Used by the publisher
-	// only, under the lock of the broadcaster.
-	initialized bool
-
 	// pktC - closed when the subscriber gets no more packets: the
 	// publisher has ended, or the subscriber was dropped
 	pktC chan av.Packet
+
+	// tooSlow - the subscriber was dropped because it did not take its
+	// packets fast enough
+	tooSlow atomic.Bool
 }
 
 // broadcaster hands the packets of one publisher to its subscribers.
@@ -56,8 +62,9 @@ func isHeader(pkt av.Packet) bool {
 	return false
 }
 
-// newSubscriber adds a subscriber. When the publisher has ended already,
-// the subscriber gets a channel that is closed.
+// newSubscriber adds a subscriber and gives it the header packets of the
+// stream. When the publisher has ended already, the subscriber gets a
+// channel that is closed.
 func (b *broadcaster) newSubscriber() *subscriber {
 	sub := &subscriber{
 		pktC: make(chan av.Packet, subscriberBuffer),
@@ -72,6 +79,7 @@ func (b *broadcaster) newSubscriber() *subscriber {
 	}
 
 	b.subscribers[sub] = struct{}{}
+	b.send(sub, b.headerPkts...)
 
 	return sub
 }
@@ -115,6 +123,7 @@ func (b *broadcaster) drop(sub *subscriber) {
 // give that subscriber a damaged picture.
 func (b *broadcaster) send(sub *subscriber, packets ...av.Packet) {
 	if cap(sub.pktC)-len(sub.pktC) < len(packets) {
+		sub.tooSlow.Store(true)
 		b.drop(sub)
 		return
 	}
@@ -126,6 +135,13 @@ func (b *broadcaster) send(sub *subscriber, packets ...av.Packet) {
 
 // broadcast hands a packet of the publisher to every subscriber.
 func (b *broadcaster) broadcast(pkt av.Packet) {
+	// The library that writes the packets to the subscribers cannot
+	// write sound in the Opus format: it ends the program on such a
+	// packet. The camera sends its sound in the AAC format.
+	if pkt.Type == av.OPUS {
+		return
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -133,64 +149,49 @@ func (b *broadcaster) broadcast(pkt av.Packet) {
 		return
 	}
 
-	if isHeader(pkt) {
-		// A newer header packet of a kind takes the place of the older
-		// one, so the list does not grow with the time that the stream
-		// runs.
-		replaced := false
-		for i, headerPkt := range b.headerPkts {
-			if headerPkt.Type == pkt.Type {
-				b.headerPkts[i] = pkt
-				replaced = true
-				break
-			}
-		}
-
-		if !replaced {
-			b.headerPkts = append(b.headerPkts, pkt)
-		}
-
-		// Subscribers that have their headers already get the new one
-		// too: the packets after it are made for it. The others get all
-		// headers with their first picture or sound.
-		for sub := range b.subscribers {
-			if sub.initialized {
-				b.send(sub, pkt)
-			}
-		}
-
+	if isHeader(pkt) && !b.keepHeader(pkt) {
 		return
 	}
 
-	// Audio / Video packets
 	for sub := range b.subscribers {
-		if sub.initialized {
-			b.send(sub, pkt)
-			continue
-		}
-
-		// Send header packets before sending any data
-		sub.initialized = true
-		b.send(sub, append(append([]av.Packet{}, b.headerPkts...), pkt)...)
+		b.send(sub, pkt)
 	}
+}
+
+// keepHeader stores a header packet for the subscribers that come later.
+// A newer header packet of a kind takes the place of the older one, so
+// the list does not grow with the time that the stream runs. The result
+// is false when the packet is the same as the one that is stored: the
+// subscribers have it already, and it need not be sent again. The caller
+// holds the lock.
+func (b *broadcaster) keepHeader(pkt av.Packet) bool {
+	for i, headerPkt := range b.headerPkts {
+		if headerPkt.Type == pkt.Type {
+			if bytes.Equal(headerPkt.Data, pkt.Data) {
+				return false
+			}
+
+			b.headerPkts[i] = pkt
+
+			return true
+		}
+	}
+
+	b.headerPkts = append(b.headerPkts, pkt)
+
+	return true
 }
 
 // closeSubscribers ends the broadcaster: every subscriber is closed, and
 // later packets and subscribers are turned away. It can be called more
-// than once. It reports whether this call was the one that ended it.
-func (b *broadcaster) closeSubscribers() bool {
+// than once.
+func (b *broadcaster) closeSubscribers() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	if b.closed {
-		return false
-	}
 
 	b.closed = true
 
 	for sub := range b.subscribers {
 		b.drop(sub)
 	}
-
-	return true
 }

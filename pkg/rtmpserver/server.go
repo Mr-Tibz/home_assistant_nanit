@@ -123,7 +123,12 @@ func (s *rtmpHandler) handleConnection(c *rtmp.Conn, nc net.Conn) {
 		select {
 		case pkt, open := <-subscriber.pktC:
 			if !open {
-				sublog.Debug().Msg("Closing subscriber because the publisher quit or the subscriber was too slow")
+				if subscriber.tooSlow.Load() {
+					sublog.Warn().Msg("Closing subscriber because it did not take the stream fast enough. It can connect again")
+				} else {
+					sublog.Debug().Msg("Closing subscriber because publisher quit")
+				}
+
 				return
 			}
 

@@ -38,8 +38,9 @@ func video(n int) av.Packet {
 	return av.Packet{Type: av.H264, Time: time.Duration(n) * time.Millisecond}
 }
 
+// header returns a header packet whose content is n.
 func header(packetType int, n int) av.Packet {
-	return av.Packet{Type: packetType, Time: time.Duration(n) * time.Millisecond}
+	return av.Packet{Type: packetType, Data: []byte{byte(n)}}
 }
 
 // take returns the packets that wait for the subscriber right now.
@@ -81,19 +82,19 @@ func TestBroadcasterSendsTheHeadersFirst(t *testing.T) {
 	b.broadcast(header(av.H264DecoderConfig, 1))
 	b.broadcast(header(av.AACDecoderConfig, 2))
 	b.broadcast(video(3))
+	b.broadcast(header(av.H264DecoderConfig, 4))
 
 	sub := b.newSubscriber()
 
-	b.broadcast(header(av.H264DecoderConfig, 4))
 	b.broadcast(video(5))
 	b.broadcast(video(6))
 
-	packets := take(sub)
-	require.Len(t, packets, 4)
-	assert.Equal(t, header(av.H264DecoderConfig, 4), packets[0], "the newer one has taken the place of the older one")
-	assert.Equal(t, header(av.AACDecoderConfig, 2), packets[1])
-	assert.Equal(t, video(5), packets[2])
-	assert.Equal(t, video(6), packets[3])
+	assert.Equal(t, []av.Packet{
+		header(av.H264DecoderConfig, 4),
+		header(av.AACDecoderConfig, 2),
+		video(5),
+		video(6),
+	}, take(sub))
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -101,8 +102,10 @@ func TestBroadcasterSendsTheHeadersFirst(t *testing.T) {
 }
 
 // A header packet that comes while the stream runs goes to the viewers
-// that are there too: the pictures after it are made for it.
-func TestBroadcasterSendsANewHeaderToItsSubscribers(t *testing.T) {
+// that are there too, if it differs from the one before: the pictures
+// after it are made for it. A header packet that only repeats the one
+// before is not sent again.
+func TestBroadcasterSendsAChangedHeaderToItsSubscribers(t *testing.T) {
 	b := newBroadcaster(&fakeConn{})
 
 	b.broadcast(header(av.H264DecoderConfig, 1))
@@ -110,19 +113,24 @@ func TestBroadcasterSendsANewHeaderToItsSubscribers(t *testing.T) {
 	sub := b.newSubscriber()
 
 	b.broadcast(video(2))
-	b.broadcast(header(av.H264DecoderConfig, 3))
-	b.broadcast(video(4))
+	b.broadcast(header(av.H264DecoderConfig, 1))
+	b.broadcast(video(3))
+	b.broadcast(header(av.H264DecoderConfig, 4))
+	b.broadcast(video(5))
 
 	assert.Equal(t, []av.Packet{
 		header(av.H264DecoderConfig, 1),
 		video(2),
-		header(av.H264DecoderConfig, 3),
-		video(4),
+		video(3),
+		header(av.H264DecoderConfig, 4),
+		video(5),
 	}, take(sub))
 }
 
-// Sound in the Opus format is sound, not a header. The old rule took every
-// packet type above 2 for a header, and Opus is 3.
+// Sound in the Opus format is sound, not a header. The old rule took
+// every packet type above 2 for a header, and Opus is 3. Such sound is
+// not handed on at all: the library that writes the packets ends the
+// program on it.
 func TestWhichPacketsAreHeaders(t *testing.T) {
 	for _, packetType := range []int{av.H264DecoderConfig, av.H264SPSPPSNALU, av.AACDecoderConfig, av.Metadata} {
 		assert.True(t, isHeader(av.Packet{Type: packetType}), av.PacketTypeString[packetType])
@@ -131,6 +139,18 @@ func TestWhichPacketsAreHeaders(t *testing.T) {
 	for _, packetType := range []int{av.H264, av.AAC, av.OPUS} {
 		assert.False(t, isHeader(av.Packet{Type: packetType}), av.PacketTypeString[packetType])
 	}
+
+	b := newBroadcaster(&fakeConn{})
+	sub := b.newSubscriber()
+
+	b.broadcast(av.Packet{Type: av.OPUS})
+	b.broadcast(video(1))
+
+	assert.Equal(t, []av.Packet{video(1)}, take(sub))
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	assert.Empty(t, b.headerPkts)
 }
 
 // A subscriber that does not take its packets is dropped. The publisher
@@ -178,9 +198,16 @@ func TestBroadcasterDropsASubscriberThatIsTooSlow(t *testing.T) {
 	// waited for it are thrown away.
 	_, open := <-slow.pktC
 	assert.False(t, open, "the slow subscriber was dropped, and nothing waits for it")
+	assert.True(t, slow.tooSlow.Load())
+
+	// The end of the broadcaster throws away what waits, so let the fast
+	// subscriber take everything first
+	require.Eventually(t, func() bool { return len(fast.pktC) == 0 }, 10*time.Second, time.Millisecond)
 
 	b.closeSubscribers()
 	<-finished
+
+	assert.False(t, fast.tooSlow.Load())
 
 	assert.Equal(t, packets, received, "the fast subscriber got every packet")
 }
@@ -288,12 +315,14 @@ func (publisher *fakePublisher) ReadPacket() (av.Packet, error) {
 // The limit is for the time without a packet, not for the stream as a
 // whole: the packets here take longer together than the limit.
 func TestReadPacketsEndsWhenThePublisherSendsNothing(t *testing.T) {
-	publisher := &fakePublisher{packets: 10, interval: 20 * time.Millisecond}
+	// The time limit is many times the time between two packets, so that
+	// a slow machine does not end the stream early
+	publisher := &fakePublisher{packets: 10, interval: 40 * time.Millisecond}
 	b := newBroadcaster(&fakeConn{})
 	sub := b.newSubscriber()
 
 	result := make(chan error, 1)
-	go func() { result <- readPackets(publisher, publisher, b, 100*time.Millisecond) }()
+	go func() { result <- readPackets(publisher, publisher, b, 300*time.Millisecond) }()
 
 	select {
 	case err := <-result:
