@@ -530,6 +530,16 @@ func (c *NanitClient) FetchAuthorized(req *http.Request, data interface{}) error
 		return err
 	}
 
+	// A request with a body needs a new reader for the second sending
+	if req.GetBody != nil {
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return fmt.Errorf("unable to send the request again: %w", bodyErr)
+		}
+
+		req.Body = body
+	}
+
 	unauthorized, err := c.fetchOnce(req, c.AuthToken(), data)
 	if err != nil {
 		return err
@@ -559,7 +569,8 @@ func (c *NanitClient) fetchOnce(req *http.Request, token string, data interface{
 		return true, nil
 	}
 
-	if res.StatusCode != 200 {
+	// 201 is the answer to a request that has made something
+	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
 		return false, statusError("HTTP request failed", res.StatusCode)
 	}
 
@@ -602,6 +613,39 @@ func (c *NanitClient) FetchMessages(babyUID string, limit int) ([]message.Messag
 	}
 
 	return data.Messages, nil
+}
+
+type pushDeviceResponsePayload struct {
+	Device struct {
+		ID int64 `json:"id"`
+	} `json:"device"`
+}
+
+// RegisterPushDevice tells the service to send the push notifications of
+// the account to the device with this token too, next to the phones with
+// the Nanit app. token is the address that the Firebase service has given
+// a device that is registered for the Nanit app for Android. It returns
+// the number that the service gives the registration.
+func (c *NanitClient) RegisterPushDevice(token string) (int64, error) {
+	body, jsonErr := json.Marshal(map[string]string{"token": token})
+	if jsonErr != nil {
+		return 0, fmt.Errorf("unable to create request: %w", jsonErr)
+	}
+
+	req, reqErr := http.NewRequest("POST", c.url("/devices/android"), bytes.NewReader(body))
+	if reqErr != nil {
+		return 0, fmt.Errorf("unable to create request: %w", reqErr)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("nanit-api-version", "1")
+
+	data := new(pushDeviceResponsePayload)
+	if err := c.FetchAuthorized(req, data); err != nil {
+		return 0, err
+	}
+
+	return data.Device.ID, nil
 }
 
 // EnsureBabies - fetches baby list if not fetched already

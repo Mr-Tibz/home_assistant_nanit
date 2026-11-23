@@ -119,6 +119,16 @@ func main() {
 		log.Info().Msgf("Event polling enabled with an interval of %v", opts.EventPolling.PollingInterval)
 	}
 
+	if utils.EnvVarBool("NANIT_PUSH_ENABLED", false) {
+		// A missing key does not end the program: the push notifications
+		// are an extra, and the stream must run without them
+		if key := utils.EnvVarStr("NANIT_PUSH_FIREBASE_API_KEY", ""); key != "" {
+			opts.Push = &app.PushOpts{FirebaseAPIKey: key}
+		} else {
+			log.Error().Msg("NANIT_PUSH_ENABLED needs NANIT_PUSH_FIREBASE_API_KEY, which is not set. No push notifications will be received.")
+		}
+	}
+
 	shutdownTimeout := utils.EnvVarSeconds("NANIT_SHUTDOWN_TIMEOUT", defaultShutdownTimeout)
 	if shutdownTimeout <= 0 {
 		log.Fatal().Msg("Invalid NANIT_SHUTDOWN_TIMEOUT. It must be 1 or more.")

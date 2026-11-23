@@ -10,6 +10,7 @@ import (
 	"github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/indiefan/home_assistant_nanit/pkg/message"
 	"github.com/indiefan/home_assistant_nanit/pkg/mqtt"
+	"github.com/indiefan/home_assistant_nanit/pkg/push"
 	"github.com/indiefan/home_assistant_nanit/pkg/rtmpserver"
 	"github.com/indiefan/home_assistant_nanit/pkg/session"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
@@ -88,8 +89,26 @@ func (app *App) Run(ctx utils.GracefulContext) {
 
 	// MQTT
 	if app.MQTTConnection != nil {
+		if app.Opts.Push != nil {
+			app.MQTTConnection.NotificationBabies = babies
+		}
+
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			app.MQTTConnection.Run(app.BabyStateManager, childCtx)
+		})
+	}
+
+	// Push notifications
+	if app.Opts.Push != nil {
+		receiver := &push.Receiver{
+			Store:          app.SessionStore,
+			Nanit:          app.RestClient,
+			FirebaseAPIKey: app.Opts.Push.FirebaseAPIKey,
+			OnNotification: app.handleNotification,
+		}
+
+		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+			receiver.Run(childCtx)
 		})
 	}
 
@@ -107,6 +126,32 @@ func (app *App) Run(ctx utils.GracefulContext) {
 	}
 
 	<-ctx.Done()
+}
+
+// handleNotification takes a push notification of the Nanit service. It
+// goes to the log and to MQTT. Sound and motion also set the time of the
+// last sound and of the last motion, as the message poll does.
+func (app *App) handleNotification(notification push.Notification) {
+	log.Info().Str("type", notification.Type).Str("baby_uid", notification.BabyUID).Time("time", notification.Time).Msg("Push notification")
+
+	known := false
+	for _, b := range app.SessionStore.Snapshot().Babies {
+		known = known || b.UID == notification.BabyUID
+	}
+
+	// The times are kept for each baby of the account, under its UID
+	if known && !notification.Time.IsZero() {
+		switch notification.Type {
+		case message.SoundEventMessageType:
+			app.BabyStateManager.NotifySoundSubscribers(notification.BabyUID, notification.Time)
+		case message.MotionEventMessageType:
+			app.BabyStateManager.NotifyMotionSubscribers(notification.BabyUID, notification.Time)
+		}
+	}
+
+	if app.MQTTConnection != nil {
+		app.MQTTConnection.PublishNotification(notification)
+	}
 }
 
 // retryAtStart runs a step of the start until it succeeds. It tries

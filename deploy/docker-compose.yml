@@ -82,6 +82,8 @@ services:
       - NANIT_EVENTS_POLLING
       - NANIT_EVENTS_POLLING_INTERVAL
       - NANIT_EVENTS_MESSAGE_TIMEOUT
+      - NANIT_PUSH_ENABLED
+      - NANIT_PUSH_FIREBASE_API_KEY
 
     volumes:
       - "${NANIT_DATA_PATH:?Set NANIT_DATA_PATH to the folder on this machine that holds session.json}:/data"

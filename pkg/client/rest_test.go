@@ -50,6 +50,19 @@ type fakeAPI struct {
 	babiesBody     string
 	babiesCalls    int32
 	babiesTokens   chan string // Authorization header of each request
+
+	// devicesStatuses - status of each registration of a push device, in
+	// order. The last entry repeats.
+	devicesStatuses []int
+	devicesRequests chan deviceRequest
+}
+
+// deviceRequest - what a registration of a push device carried
+type deviceRequest struct {
+	token       string
+	auth        string
+	contentType string
+	apiVersion  string
 }
 
 // rotateTokens answers a renewal the way the real server does.
@@ -85,6 +98,9 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		babiesStatuses: []int{http.StatusOK},
 		babiesBody:     `{"babies":[{"uid":"baby-1","name":"Baby","camera_uid":"camera-1"}]}`,
 		babiesTokens:   make(chan string, 16),
+
+		devicesStatuses: []int{http.StatusCreated},
+		devicesRequests: make(chan deviceRequest, 16),
 	}
 
 	mux := http.NewServeMux()
@@ -134,6 +150,34 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		w.WriteHeader(status)
 		if status == http.StatusOK {
 			w.Write([]byte(api.babiesBody))
+		}
+	})
+
+	mux.HandleFunc("/devices/android", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		json.NewDecoder(r.Body).Decode(&body)
+
+		call := len(api.devicesRequests)
+		api.devicesRequests <- deviceRequest{
+			token:       body["token"],
+			auth:        r.Header.Get("Authorization"),
+			contentType: r.Header.Get("Content-Type"),
+			apiVersion:  r.Header.Get("nanit-api-version"),
+		}
+
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		status := api.devicesStatuses[len(api.devicesStatuses)-1]
+		if call < len(api.devicesStatuses) {
+			status = api.devicesStatuses[call]
+		}
+
+		w.WriteHeader(status)
+		if status == http.StatusCreated || status == http.StatusOK {
+			w.Write([]byte(`{"device":{"id":4711,"token":"` + body["token"] + `"}}`))
 		}
 	})
 
@@ -926,4 +970,59 @@ func TestRememberMessageTimeNeverGoesBack(t *testing.T) {
 	c.rememberMessageTime(t7)
 	assert.Equal(t, t7, c.SessionStore.Snapshot().LastSeenMessageTime)
 	assert.True(t, t7.Equal(storedSession(t, c).LastSeenMessageTime), "the time is saved")
+}
+
+func TestRegisterPushDevice(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+
+	id, err := c.RegisterPushDevice("fcm-token")
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(4711), id)
+
+	request := <-api.devicesRequests
+	assert.Equal(t, "fcm-token", request.token)
+	assert.Equal(t, "access-1", request.auth)
+	assert.Equal(t, "application/json", request.contentType)
+	assert.Equal(t, "1", request.apiVersion)
+}
+
+// The request has a body, and it must arrive whole the second time too.
+func TestRegisterPushDeviceRenewsAnExpiredToken(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.devicesStatuses = []int{http.StatusUnauthorized, http.StatusCreated}
+
+	id, err := c.RegisterPushDevice("fcm-token")
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(4711), id)
+
+	first, second := <-api.devicesRequests, <-api.devicesRequests
+	assert.Equal(t, "access-1", first.auth)
+	assert.Equal(t, "fcm-token", first.token)
+	assert.Equal(t, "access-2", second.auth)
+	assert.Equal(t, "fcm-token", second.token)
+}
+
+func TestRegisterPushDeviceReportsFailures(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status    int
+		temporary bool
+	}{
+		"the server cannot serve it now": {http.StatusServiceUnavailable, true},
+		"the server refuses it":          {http.StatusUnprocessableEntity, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI(t)
+			c := newTestClient(t, api)
+			api.devicesStatuses = []int{tc.status}
+
+			_, err := c.RegisterPushDevice("fcm-token")
+
+			require.Error(t, err)
+			assert.Equal(t, tc.temporary, IsTemporary(err), "got: %v", err)
+		})
+	}
 }
