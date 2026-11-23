@@ -59,3 +59,5 @@ camera:
 ```
 
 Restart Home Assistant and you should now have a camera entity named Nanit for use in dashboards.
+
+The notifications of the Nanit app (motion, sound, a crying baby and others) can arrive in Home Assistant too, as an event entity: see [docs/sensors.md](docs/sensors.md#push-notifications).

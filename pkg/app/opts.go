@@ -15,6 +15,15 @@ type Opts struct {
 	RTMP             *RTMPOpts
 	EventPolling     EventPollingOpts
 	Websocket        WebsocketOpts
+
+	// Push - nil when the push notifications are not received
+	Push *PushOpts
+}
+
+// PushOpts - options for the push notifications of the Nanit service
+type PushOpts struct {
+	// FirebaseAPIKey - the API key of the Nanit app for Android
+	FirebaseAPIKey string
 }
 
 // WebsocketOpts - options for the websocket connection to the camera.

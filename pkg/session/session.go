@@ -17,6 +17,10 @@ import (
 
 // Revision - marks the version of the structure of a session file. Only files with equal revision will be loaded
 // Note: you should increment this whenever you change the Session structure
+//
+// A field that a file may lack, like Push, needs no new revision. A new
+// revision makes the program ignore the file that is there, and with it
+// the refresh token, so a new login would be needed.
 const Revision = 3
 
 // Session - application session data container
@@ -27,6 +31,30 @@ type Session struct {
 	Babies              []baby.Baby `json:"babies"`
 	RefreshToken        string      `json:"refreshToken"`
 	LastSeenMessageTime time.Time   `json:"lastSeenMessageTime"`
+
+	// Push - the registration for push notifications, nil when there is
+	// none. The value it points to is never changed: an update puts a
+	// new value in its place, so a snapshot can be read without a lock.
+	Push *Push `json:"push,omitempty"`
+}
+
+// Push - what the receiver of push notifications needs to connect again
+// without a new registration. The numbers are stored as text, because
+// they do not fit in the numbers of every tool that reads JSON.
+type Push struct {
+	// AndroidID and SecurityToken - the device that the Firebase service
+	// has made for this program, and the secret that proves it
+	AndroidID     uint64 `json:"androidId,string"`
+	SecurityToken uint64 `json:"securityToken,string"`
+
+	// Token - the address for notifications to this device
+	Token string `json:"token"`
+
+	// Registered - the Nanit service has been given the token
+	Registered bool `json:"registered"`
+
+	// DeviceID - the number that the Nanit service gave the registration
+	DeviceID int64 `json:"deviceId,omitempty"`
 }
 
 // Store - application session store context

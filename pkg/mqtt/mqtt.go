@@ -1,23 +1,36 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
+	"github.com/indiefan/home_assistant_nanit/pkg/push"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
 	"github.com/rs/zerolog/log"
 )
+
+// publishTimeout - time that a message gets to leave for the broker
+const publishTimeout = 5 * time.Second
 
 type SendLightCommandHandler func(nightLightState bool)
 type SendStandbyCommandHandler func(standbyState bool)
 
 // Connection - MQTT context
 type Connection struct {
-	Opts                      Opts
-	StateManager              *baby.StateManager
+	Opts         Opts
+	StateManager *baby.StateManager
+
+	// NotificationBabies - the babies whose push notifications are
+	// published. Home Assistant is told about an entity for each of them.
+	// Set it before Run.
+	NotificationBabies []baby.Baby
+
+	// client is made with the connection and never replaced, so that
+	// PublishNotification can use it from another goroutine than Run
 	client                    MQTT.Client
 	sendLightCommandHandler   SendLightCommandHandler
 	sendStandbyCommandHandler SendStandbyCommandHandler
@@ -25,23 +38,22 @@ type Connection struct {
 
 // NewConnection - constructor
 func NewConnection(opts Opts) *Connection {
+	clientOpts := MQTT.NewClientOptions()
+	clientOpts.AddBroker(opts.BrokerURL)
+	clientOpts.SetClientID(opts.TopicPrefix)
+	clientOpts.SetUsername(opts.Username)
+	clientOpts.SetPassword(opts.Password)
+	clientOpts.SetCleanSession(false)
+
 	return &Connection{
-		Opts: opts,
+		Opts:   opts,
+		client: MQTT.NewClient(clientOpts),
 	}
 }
 
 // Run - runs the mqtt connection handler
 func (conn *Connection) Run(manager *baby.StateManager, ctx utils.GracefulContext) {
 	conn.StateManager = manager
-
-	opts := MQTT.NewClientOptions()
-	opts.AddBroker(conn.Opts.BrokerURL)
-	opts.SetClientID(conn.Opts.TopicPrefix)
-	opts.SetUsername(conn.Opts.Username)
-	opts.SetPassword(conn.Opts.Password)
-	opts.SetCleanSession(false)
-
-	conn.client = MQTT.NewClient(opts)
 
 	utils.RunWithPerseverance(func(attempt utils.AttemptContext) {
 		runMqtt(conn, attempt)
@@ -156,6 +168,8 @@ func runMqtt(conn *Connection, attempt utils.AttemptContext) {
 
 	log.Info().Str("broker_url", conn.Opts.BrokerURL).Msg("Successfully connected to MQTT broker")
 
+	conn.announceNotifications()
+
 	unsubscribe := conn.StateManager.Subscribe(func(babyUID string, state baby.State) {
 		publish := func(key string, value interface{}) {
 			topic := fmt.Sprintf("%v/babies/%v/%v", conn.Opts.TopicPrefix, babyUID, key)
@@ -186,4 +200,99 @@ func runMqtt(conn *Connection, attempt utils.AttemptContext) {
 	log.Debug().Msg("Closing MQTT connection on interrupt")
 	unsubscribe()
 	conn.client.Disconnect(250)
+}
+
+// notificationTopic - the topic for the push notifications about a baby
+func (conn *Connection) notificationTopic(babyUID string) string {
+	return fmt.Sprintf("%v/babies/%v/notification", conn.Opts.TopicPrefix, babyUID)
+}
+
+// PublishNotification publishes a push notification of the Nanit service
+// about one of NotificationBabies. A notification that is published while
+// there is no connection to the broker is lost.
+func (conn *Connection) PublishNotification(notification push.Notification) {
+	known := false
+	for _, b := range conn.NotificationBabies {
+		known = known || b.UID == notification.BabyUID
+	}
+
+	if !known {
+		// The topic and the entity are those of a baby
+		log.Warn().Str("type", notification.Type).Str("baby_uid", notification.BabyUID).Msg("Push notification is not about a baby of this account, not published")
+		return
+	}
+
+	payload, err := notificationPayload(notification)
+	if err != nil {
+		log.Error().Err(err).Str("type", notification.Type).Msg("Unable to publish a push notification")
+		return
+	}
+
+	token := conn.client.Publish(conn.notificationTopic(notification.BabyUID), 0, false, payload)
+	if !token.WaitTimeout(publishTimeout) {
+		log.Error().Str("type", notification.Type).Msg("Unable to publish a push notification: the broker did not take it in time")
+	} else if token.Error() != nil {
+		log.Error().Err(token.Error()).Str("type", notification.Type).Msg("Unable to publish a push notification")
+	}
+}
+
+// notificationPayload builds the message for a push notification: a JSON
+// object with everything that the notification carries, and event_type,
+// which is what an event entity of Home Assistant reads.
+func notificationPayload(notification push.Notification) ([]byte, error) {
+	payload := make(map[string]interface{}, len(notification.Fields)+1)
+	for key, value := range notification.Fields {
+		payload[key] = value
+	}
+
+	payload["event_type"] = notification.Kind()
+
+	return json.Marshal(payload)
+}
+
+// announceNotifications tells Home Assistant about one event entity for
+// each of NotificationBabies. Home Assistant reads this from a topic that
+// it watches (MQTT discovery), and the broker keeps the message for a
+// Home Assistant that starts later.
+func (conn *Connection) announceNotifications() {
+	for _, b := range conn.NotificationBabies {
+		topic, payload, err := notificationDiscovery(b, conn.notificationTopic(b.UID))
+		if err != nil {
+			log.Error().Err(err).Str("baby_uid", b.UID).Msg("Unable to announce the notifications to Home Assistant")
+			continue
+		}
+
+		token := conn.client.Publish(topic, 1, true, payload)
+		if !token.WaitTimeout(publishTimeout) {
+			log.Error().Str("topic", topic).Msg("Unable to announce the notifications to Home Assistant: the broker did not take the message in time")
+		} else if token.Error() != nil {
+			log.Error().Err(token.Error()).Str("topic", topic).Msg("Unable to announce the notifications to Home Assistant")
+		}
+	}
+}
+
+// notificationDiscovery returns the topic and the message that make Home
+// Assistant create the event entity for the notifications about a baby.
+func notificationDiscovery(b baby.Baby, stateTopic string) (topic string, payload []byte, err error) {
+	id := "nanit_" + b.UID
+
+	name := "Nanit"
+	if b.Name != "" {
+		name = "Nanit " + b.Name
+	}
+
+	payload, err = json.Marshal(map[string]interface{}{
+		"name":        "Notification",
+		"unique_id":   id + "_notification",
+		"state_topic": stateTopic,
+		"event_types": push.Kinds(),
+		"icon":        "mdi:bell-ring",
+		"device": map[string]interface{}{
+			"identifiers":  []string{id},
+			"name":         name,
+			"manufacturer": "Nanit",
+		},
+	})
+
+	return fmt.Sprintf("homeassistant/event/%v/notification/config", id), payload, err
 }
