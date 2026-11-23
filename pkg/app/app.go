@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/indiefan/home_assistant_nanit/pkg/activity"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 	"github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/indiefan/home_assistant_nanit/pkg/message"
@@ -96,6 +97,28 @@ func (app *App) Run(ctx utils.GracefulContext) {
 		ctx.RunAsChild(func(childCtx utils.GracefulContext) {
 			app.MQTTConnection.Run(app.BabyStateManager, childCtx)
 		})
+	}
+
+	// Activity list
+	if app.Opts.ActivityPolling && app.MQTTConnection != nil {
+		for _, babyInfo := range babies {
+			babyUID := babyInfo.UID
+
+			poller := &activity.Poller{
+				Fetch: func() ([]activity.Event, error) {
+					return app.RestClient.FetchEvents(babyUID, activity.FetchLimit)
+				},
+				Publish: func(event activity.Event, backfill bool) error {
+					return app.MQTTConnection.PublishActivity(babyUID, event, backfill)
+				},
+			}
+
+			// A stop of the program waits for a request that is running,
+			// so that a renewal of the token inside it can store its result
+			ctx.RunAsChild(func(childCtx utils.GracefulContext) {
+				poller.Run(childCtx)
+			})
+		}
 	}
 
 	// Push notifications

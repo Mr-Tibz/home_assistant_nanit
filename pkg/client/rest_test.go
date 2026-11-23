@@ -51,6 +51,9 @@ type fakeAPI struct {
 	babiesCalls    int32
 	babiesTokens   chan string // Authorization header of each request
 
+	eventsBody  string
+	eventsQuery atomic.Value // query of the last request for the activity list
+
 	// devicesStatuses - status of each registration of a push device, in
 	// order. The last entry repeats.
 	devicesStatuses []int
@@ -151,6 +154,11 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 		if status == http.StatusOK {
 			w.Write([]byte(api.babiesBody))
 		}
+	})
+
+	mux.HandleFunc("/babies/baby-1/events", func(w http.ResponseWriter, r *http.Request) {
+		api.eventsQuery.Store(r.URL.RawQuery)
+		w.Write([]byte(api.eventsBody))
 	})
 
 	mux.HandleFunc("/devices/android", func(w http.ResponseWriter, r *http.Request) {
@@ -1025,4 +1033,40 @@ func TestRegisterPushDeviceReportsFailures(t *testing.T) {
 			assert.Equal(t, tc.temporary, IsTemporary(err), "got: %v", err)
 		})
 	}
+}
+
+func TestFetchEvents(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	// As the service sends it, with fields that this program does not read
+	api.eventsBody = `{"events":[
+		{"uid":"c1b96daf28","id":40202746060,"key":"VISIT","internal_key":"VISIT_WOKE_UP","title":"Parent approaching","time":1791772138.97,"begin_ts":1791772107.47,"created_at":"2026-10-12T02:34:28Z","clip":true,"playlist":{"url":"https://example.com/x"}},
+		{"uid":"7fa5814758","key":"MOTION","internal_key":"MOTION","title":"MOTION","time":1791772000,"created_at":"2026-10-12T02:26:40Z","clip":null}
+	]}`
+
+	events, err := c.FetchEvents("baby-1", 30)
+
+	require.NoError(t, err)
+	require.Len(t, events, 2)
+	assert.Equal(t, "limit=30", api.eventsQuery.Load())
+	assert.Equal(t, "c1b96daf28", events[0].UID)
+	assert.Equal(t, "VISIT", events[0].Key)
+	assert.Equal(t, "VISIT_WOKE_UP", events[0].InternalKey)
+	assert.Equal(t, "Parent approaching", events[0].Text())
+	assert.Equal(t, 1791772138.97, events[0].Time)
+	assert.Equal(t, "2026-10-12T02:34:28Z", events[0].CreatedAt)
+	assert.True(t, events[0].Clip)
+	assert.Equal(t, "Motion", events[1].Text())
+	assert.False(t, events[1].Clip)
+}
+
+func TestFetchEventsOfAnEmptyList(t *testing.T) {
+	api := newFakeAPI(t)
+	c := newTestClient(t, api)
+	api.eventsBody = `{"events":[]}`
+
+	events, err := c.FetchEvents("baby-1", 30)
+
+	require.NoError(t, err)
+	assert.Empty(t, events)
 }

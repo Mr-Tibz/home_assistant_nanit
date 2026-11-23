@@ -119,6 +119,15 @@ func main() {
 		log.Info().Msgf("Event polling enabled with an interval of %v", opts.EventPolling.PollingInterval)
 	}
 
+	if utils.EnvVarBool("NANIT_ACTIVITY_POLLING", false) {
+		// The events go to MQTT and nowhere else
+		if opts.MQTT != nil {
+			opts.ActivityPolling = true
+		} else {
+			log.Error().Msg("NANIT_ACTIVITY_POLLING needs MQTT (NANIT_MQTT_ENABLED), which is not on. The activity list will not be followed.")
+		}
+	}
+
 	if utils.EnvVarBool("NANIT_PUSH_ENABLED", false) {
 		// A missing key does not end the program: the push notifications
 		// are an extra, and the stream must run without them
