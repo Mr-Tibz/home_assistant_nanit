@@ -14,7 +14,7 @@ In case you run into trouble and need to see what is going on, you can try using
 
 ## Activity list
 
-The Nanit app shows a list of events for a baby: motion, sound, and the events about sleep. With `NANIT_ACTIVITY_POLLING` (see [.env.sample](../.env.sample)), the app asks the Nanit service for this list once a minute and publishes every entry that is new:
+The Nanit app shows a list of events for a baby: motion, sound, and the events about sleep. With `NANIT_ACTIVITY_POLLING` (see [.env.sample](../.env.sample)), the app asks the Nanit service for this list once a minute (`NANIT_ACTIVITY_POLLING_INTERVAL`) and publishes every entry that is new:
 
 - `nanit/babies/{baby_uid}/event` - one message for each event, a JSON object
 
@@ -37,6 +37,7 @@ The Nanit app shows a list of events for a baby: motion, sound, and the events a
 
 - The service keeps this list whether or not the account gets notifications, and it sends nothing to a phone because of this.
 - The service adds the events about sleep late: about 15 minutes after they happen, and sometimes hours. `time` is the time of the event, and `created_at` is the time of the entry. Motion and sound are added at once.
+- The service sends some 5 kilobytes for each entry, without compression. So a request asks for the 5 newest entries, and one request every 15 minutes, and the first one, for the newest 30. An entry that is added late behind more than 4 newer ones is therefore found up to 15 minutes later. This comes to some 50 megabytes a day.
 - A crying baby and temperature or humidity out of range are not in this list. They come as push notifications only, see below.
 - At every start the app publishes the newest 30 entries again, with `backfill` set, because it does not know which of them an earlier run has published. A message can also arrive twice after a failure of the connection to the broker. Whatever keeps a record of the events must go by `uid`, and whatever reacts to an event should leave out those with `backfill`.
 - An entry that the service adds while the app does not run is published at the next start, as long as it is among the newest 30.

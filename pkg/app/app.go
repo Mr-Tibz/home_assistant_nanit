@@ -105,12 +105,13 @@ func (app *App) Run(ctx utils.GracefulContext) {
 			babyUID := babyInfo.UID
 
 			poller := &activity.Poller{
-				Fetch: func() ([]activity.Event, error) {
-					return app.RestClient.FetchEvents(babyUID, activity.FetchLimit)
+				Fetch: func(limit int) ([]activity.Event, error) {
+					return app.RestClient.FetchEvents(babyUID, limit)
 				},
 				Publish: func(event activity.Event, backfill bool) error {
 					return app.MQTTConnection.PublishActivity(babyUID, event, backfill)
 				},
+				Interval: app.Opts.ActivityPollingInterval,
 			}
 
 			// A stop of the program waits for a request that is running,

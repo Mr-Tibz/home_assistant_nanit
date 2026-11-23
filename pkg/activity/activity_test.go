@@ -2,6 +2,7 @@ package activity
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -22,8 +23,11 @@ type fakeList struct {
 	mutex sync.Mutex
 
 	// rounds - the answer to each request, in order. The last one repeats.
-	rounds  []func() ([]Event, error)
+	rounds  []func(limit int) ([]Event, error)
 	fetches int
+
+	// limits - how many entries each request asked for
+	limits []int
 
 	// refuse - UIDs for which the next Publish fails, once each
 	refuse map[string]bool
@@ -31,20 +35,39 @@ type fakeList struct {
 	out []published
 }
 
-func list(events ...Event) func() ([]Event, error) {
-	return func() ([]Event, error) { return append([]Event(nil), events...), nil }
+// list answers a request the way the service does: with the newest
+// entries, as many as the request asks for.
+func list(events ...Event) func(limit int) ([]Event, error) {
+	return func(limit int) ([]Event, error) {
+		newest := append([]Event(nil), events...)
+		sort.SliceStable(newest, func(i, j int) bool { return newest[i].Time > newest[j].Time })
+
+		if len(newest) > limit {
+			newest = newest[:limit]
+		}
+
+		return newest, nil
+	}
 }
 
-func (f *fakeList) fetch() ([]Event, error) {
+func (f *fakeList) fetch(limit int) ([]Event, error) {
 	f.mutex.Lock()
 	round := f.rounds[len(f.rounds)-1]
 	if f.fetches < len(f.rounds) {
 		round = f.rounds[f.fetches]
 	}
 	f.fetches++
+	f.limits = append(f.limits, limit)
 	f.mutex.Unlock()
 
-	return round()
+	return round(limit)
+}
+
+func (f *fakeList) asked() []int {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	return append([]int(nil), f.limits...)
 }
 
 func (f *fakeList) publish(event Event, backfill bool) error {
@@ -78,7 +101,12 @@ func (f *fakeList) requests() int {
 // run runs a poller on f until f has had the given number of requests,
 // and returns what was handed on.
 func run(t *testing.T, f *fakeList, requests int) []published {
-	poller := &Poller{Fetch: f.fetch, Publish: f.publish, Interval: time.Millisecond}
+	return runWith(t, f, requests, time.Hour)
+}
+
+// runWith is run with a time between two requests for a long list.
+func runWith(t *testing.T, f *fakeList, requests int, fullInterval time.Duration) []published {
+	poller := &Poller{Fetch: f.fetch, Publish: f.publish, Interval: time.Millisecond, FullInterval: fullInterval}
 	runner := utils.RunWithGracefulCancel(poller.Run)
 
 	require.Eventually(t, func() bool { return f.requests() >= requests }, 10*time.Second, time.Millisecond)
@@ -97,19 +125,19 @@ var (
 )
 
 func TestWhatIsInTheListAtTheStartIsBackfillOldestFirst(t *testing.T) {
-	f := &fakeList{rounds: []func() ([]Event, error){list(c, a, b)}}
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){list(c, a, b)}}
 
 	assert.Equal(t, []published{{"a", true}, {"b", true}, {"c", true}}, run(t, f, 4))
 }
 
 func TestANewEntryIsHandedOnOnce(t *testing.T) {
-	f := &fakeList{rounds: []func() ([]Event, error){list(b, a), list(c, b, a), list(c, b, late, a)}}
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){list(b, a), list(c, b, a), list(c, b, late, a)}}
 
 	assert.Equal(t, []published{{"a", true}, {"b", true}, {"c", false}, {"late", false}}, run(t, f, 6))
 }
 
 func TestAnEventIsHandedOnAgainWhenThatFailed(t *testing.T) {
-	f := &fakeList{rounds: []func() ([]Event, error){list(c, b, a)}, refuse: map[string]bool{"b": true}}
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){list(c, b, a)}, refuse: map[string]bool{"b": true}}
 
 	// b fails in the first round. c waits for it, and both count as
 	// backfill: the round in which the list was first read is not over.
@@ -117,8 +145,8 @@ func TestAnEventIsHandedOnAgainWhenThatFailed(t *testing.T) {
 }
 
 func TestAFailedRequestIsFollowedByTheNext(t *testing.T) {
-	failed := func() ([]Event, error) { return nil, errors.New("HTTP request failed") }
-	f := &fakeList{rounds: []func() ([]Event, error){failed, failed, list(a), list(b, a)}}
+	failed := func(int) ([]Event, error) { return nil, errors.New("HTTP request failed") }
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){failed, failed, list(a), list(b, a)}}
 
 	assert.Equal(t, []published{{"a", true}, {"b", false}}, run(t, f, 5))
 }
@@ -126,15 +154,93 @@ func TestAFailedRequestIsFollowedByTheNext(t *testing.T) {
 // A fault in this part must not end the program, which would stop the
 // stream of the camera.
 func TestAPanicDoesNotEndTheProgram(t *testing.T) {
-	f := &fakeList{rounds: []func() ([]Event, error){func() ([]Event, error) { panic("a fault") }, list(a)}}
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){func(int) ([]Event, error) { panic("a fault") }, list(a)}}
 
 	assert.Equal(t, []published{{"a", true}}, run(t, f, 3))
 }
 
 func TestAnEntryWithoutAnIDIsLeftOut(t *testing.T) {
-	f := &fakeList{rounds: []func() ([]Event, error){list(Event{Key: "MOTION", Time: 50}, a)}}
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){list(Event{Key: "MOTION", Time: 50}, a)}}
 
 	assert.Equal(t, []published{{"a", true}}, run(t, f, 3))
+}
+
+// numbered returns events with the IDs and the times from..to.
+func numbered(from int, to int) []Event {
+	var events []Event
+	for i := from; i <= to; i++ {
+		events = append(events, Event{UID: string(rune('A' + i)), Key: "MOTION", Time: float64(1000 + i)})
+	}
+
+	return events
+}
+
+func uids(out []published) string {
+	text := ""
+	for _, p := range out {
+		text += p.uid
+	}
+
+	return text
+}
+
+// The service sends much for each entry, so only the first request and
+// one now and then ask for a long list.
+func TestMostRequestsAskForAShortList(t *testing.T) {
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){list(numbered(0, 9)...)}}
+
+	out := run(t, f, 5)
+
+	assert.Equal(t, "ABCDEFGHIJ", uids(out), "the first request reaches back")
+	asked := f.asked()
+	assert.Equal(t, FullLimit, asked[0])
+	for _, limit := range asked[1:5] {
+		assert.Equal(t, QuickLimit, limit)
+	}
+}
+
+// An entry about sleep is added late, with the time of the event. When
+// newer entries were added before it, a short list does not show it.
+func TestALongListFindsAnEntryBehindNewerOnes(t *testing.T) {
+	hidden := Event{UID: "hidden", Key: "FELL_ASLEEP", Time: 1000.5}
+	before := list(numbered(0, 9)...)
+	after := list(append(numbered(0, 9), hidden)...)
+
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){before, after}}
+	out := runWith(t, f, 12, 5*time.Millisecond)
+
+	assert.Equal(t, published{"hidden", false}, out[len(out)-1])
+	assert.Len(t, out, 11)
+	assert.Contains(t, f.asked()[1:], FullLimit, "a long list is asked for again after the time for it")
+}
+
+// More entries than a short list holds were added since the last
+// request: all of the short list is new, and the rest is asked for at once.
+func TestAShortListOfNewEntriesOnlyIsFollowedByALongOne(t *testing.T) {
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){
+		list(numbered(0, 1)...),
+		list(numbered(0, 9)...), // the short list of the second request
+		list(numbered(0, 9)...), // the long list that follows it at once
+	}}
+
+	out := run(t, f, 5)
+
+	assert.Equal(t, "ABCDEFGHIJ", uids(out))
+	assert.Equal(t, []int{FullLimit, QuickLimit, FullLimit}, f.asked()[:3])
+	for _, p := range out[2:] {
+		assert.False(t, p.backfill)
+	}
+}
+
+// An event that could not be handed on may not be in a short list, so
+// the next request asks for a long list again.
+func TestAfterAFailureTheNextRequestAsksForALongListAgain(t *testing.T) {
+	f := &fakeList{rounds: []func(limit int) ([]Event, error){list(numbered(0, 9)...)}, refuse: map[string]bool{"C": true}}
+
+	out := run(t, f, 4)
+
+	assert.Equal(t, "ABCDEFGHIJ", uids(out))
+	assert.Equal(t, []int{FullLimit, FullLimit, QuickLimit}, f.asked()[:3])
 }
 
 func TestText(t *testing.T) {
