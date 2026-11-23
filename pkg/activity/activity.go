@@ -137,6 +137,10 @@ func (p *Poller) Run(ctx utils.GracefulContext) {
 		if err != nil {
 			failures++
 			log.Warn().Err(err).Msg("Unable to follow the activity list, will try again")
+
+			// An event that could not be handed on may not be in the
+			// next short list, so the next request is for a long one
+			lastFull = time.Time{}
 		} else {
 			failures = 0
 			// From here on, an entry that is not known is a new one
@@ -199,9 +203,7 @@ func (p *Poller) round(seen map[string]bool, backfill bool, long bool) (wasLong 
 		}
 
 		if err := p.Publish(event, backfill); err != nil {
-			// The rest waits too, so that the order is kept. The next
-			// request is one for a long list again, because the event
-			// may not be in a short one.
+			// The rest waits too, so that the order is kept
 			return false, fmt.Errorf("unable to hand on the event %v: %w", event.Key, err)
 		}
 

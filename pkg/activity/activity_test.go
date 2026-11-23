@@ -243,6 +243,19 @@ func TestAfterAFailureTheNextRequestAsksForALongListAgain(t *testing.T) {
 	assert.Equal(t, []int{FullLimit, FullLimit, QuickLimit}, f.asked()[:3])
 }
 
+// The same after a failure in a request for a short list.
+func TestAfterAFailureWithAShortListTheNextRequestAsksForALongList(t *testing.T) {
+	f := &fakeList{
+		rounds: []func(limit int) ([]Event, error){list(a, b), list(a, b, c)},
+		refuse: map[string]bool{"c": true},
+	}
+
+	out := run(t, f, 5)
+
+	assert.Equal(t, []published{{"a", true}, {"b", true}, {"c", false}}, out)
+	assert.Equal(t, []int{FullLimit, QuickLimit, FullLimit, QuickLimit}, f.asked()[:4])
+}
+
 func TestText(t *testing.T) {
 	assert.Equal(t, "Motion", Event{Key: "MOTION", Title: "MOTION"}.Text())
 	assert.Equal(t, "Sound", Event{Key: "SOUND", Title: "SOUND"}.Text())
