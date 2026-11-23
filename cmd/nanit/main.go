@@ -5,9 +5,11 @@ import (
 	"os/signal"
 	"syscall"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/rs/zerolog/log"
+	"github.com/indiefan/home_assistant_nanit/pkg/activity"
 	"github.com/indiefan/home_assistant_nanit/pkg/app"
 	"github.com/indiefan/home_assistant_nanit/pkg/client"
 	"github.com/indiefan/home_assistant_nanit/pkg/mqtt"
@@ -55,6 +57,10 @@ func websocketOpts() app.WebsocketOpts {
 // take longer than this. Where the container gets more time to stop,
 // NANIT_SHUTDOWN_TIMEOUT can give the clean up more time too.
 const defaultShutdownTimeout = 8 * time.Second
+
+// minActivityInterval - the shortest time between two requests for the
+// activity list of the Nanit service
+const minActivityInterval = 10 * time.Second
 
 func main() {
 	initLogger()
@@ -123,6 +129,18 @@ func main() {
 		// The events go to MQTT and nowhere else
 		if opts.MQTT != nil {
 			opts.ActivityPolling = true
+			opts.ActivityPollingInterval = activity.DefaultInterval
+
+			// A wrong value does not end the program: this part is an
+			// extra, and the stream must run without it
+			if value := utils.EnvVarStr("NANIT_ACTIVITY_POLLING_INTERVAL", ""); value != "" {
+				seconds, err := strconv.Atoi(value)
+				if err != nil || time.Duration(seconds)*time.Second < minActivityInterval {
+					log.Error().Msgf("NANIT_ACTIVITY_POLLING_INTERVAL must be a number of seconds, %v or more. Using %v.", int(minActivityInterval.Seconds()), activity.DefaultInterval)
+				} else {
+					opts.ActivityPollingInterval = time.Duration(seconds) * time.Second
+				}
+			}
 		} else {
 			log.Error().Msg("NANIT_ACTIVITY_POLLING needs MQTT (NANIT_MQTT_ENABLED), which is not on. The activity list will not be followed.")
 		}

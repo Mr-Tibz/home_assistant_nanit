@@ -22,6 +22,10 @@ type Opts struct {
 	// ActivityPolling - follow the activity list of the Nanit service
 	// and publish its events over MQTT
 	ActivityPolling bool
+
+	// ActivityPollingInterval - time between two requests for the
+	// activity list. Zero means the default of the activity package.
+	ActivityPollingInterval time.Duration
 }
 
 // PushOpts - options for the push notifications of the Nanit service
