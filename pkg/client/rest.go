@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/indiefan/home_assistant_nanit/pkg/activity"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 	"github.com/indiefan/home_assistant_nanit/pkg/message"
 	"github.com/indiefan/home_assistant_nanit/pkg/session"
@@ -613,6 +614,29 @@ func (c *NanitClient) FetchMessages(babyUID string, limit int) ([]message.Messag
 	}
 
 	return data.Messages, nil
+}
+
+type eventsResponsePayload struct {
+	Events []activity.Event `json:"events"`
+}
+
+// FetchEvents fetches the newest entries of the activity list of a baby:
+// the events that the Nanit app shows, such as motion, sound and "Baby
+// fell asleep". The service keeps this list whether or not the account
+// gets notifications.
+func (c *NanitClient) FetchEvents(babyUID string, limit int) ([]activity.Event, error) {
+	req, reqErr := http.NewRequest("GET", c.url(fmt.Sprintf("/babies/%s/events?limit=%d", babyUID, limit)), nil)
+
+	if reqErr != nil {
+		return nil, fmt.Errorf("unable to create request: %w", reqErr)
+	}
+
+	data := new(eventsResponsePayload)
+	if err := c.FetchAuthorized(req, data); err != nil {
+		return nil, err
+	}
+
+	return data.Events, nil
 }
 
 type pushDeviceResponsePayload struct {

@@ -12,6 +12,37 @@ You can configure these in your [HASS setup](./home-assistant.md).
 
 In case you run into trouble and need to see what is going on, you can try using [MQTT Explorer](http://mqtt-explorer.com/).
 
+## Activity list
+
+The Nanit app shows a list of events for a baby: motion, sound, and the events about sleep. With `NANIT_ACTIVITY_POLLING` (see [.env.sample](../.env.sample)), the app asks the Nanit service for this list once a minute and publishes every entry that is new:
+
+- `nanit/babies/{baby_uid}/event` - one message for each event, a JSON object
+
+```json
+{"uid": "c1b96daf28", "key": "FELL_ASLEEP", "detail": "FELL_ASLEEP", "title": "Baby fell asleep", "time": 1791772138.97, "created_at": "2026-10-12T02:34:28Z", "clip": true, "backfill": false}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `uid` | the ID of the entry. It never changes. |
+| `key` | the kind: `MOTION`, `SOUND`, `FELL_ASLEEP`, `WOKE_UP`, `PUT_IN_BED`, `PUT_TO_SLEEP`, `REMOVED`, `REMOVED_ASLEEP`, `VISIT` |
+| `detail` | a finer kind where the service has one, for example `VISIT_WOKE_UP`. Else the same as `key`. |
+| `title` | a text for a person: `Motion`, `Sound`, or the text of the Nanit app, such as `Baby fell asleep` |
+| `time` | when the event happened (Unix time, seconds) |
+| `created_at` | when the service added the entry to the list |
+| `clip` | the Nanit app has a video clip of the event |
+| `backfill` | `true` for an entry that was in the list already when the app started |
+
+### What to know
+
+- The service keeps this list whether or not the account gets notifications, and it sends nothing to a phone because of this.
+- The service adds the events about sleep late: about 15 minutes after they happen, and sometimes hours. `time` is the time of the event, and `created_at` is the time of the entry. Motion and sound are added at once.
+- A crying baby and temperature or humidity out of range are not in this list. They come as push notifications only, see below.
+- At every start the app publishes the newest 30 entries again, with `backfill` set, because it does not know which of them an earlier run has published. A message can also arrive twice after a failure of the connection to the broker. Whatever keeps a record of the events must go by `uid`, and whatever reacts to an event should leave out those with `backfill`.
+- An entry that the service adds while the app does not run is published at the next start, as long as it is among the newest 30.
+
+In Home Assistant, an automation with an MQTT trigger on `nanit/babies/+/event` gets each event in `trigger.payload_json`.
+
 ## Push notifications
 
 With `NANIT_PUSH_ENABLED` (see [.env.sample](../.env.sample)), the app receives the push notifications that the Nanit service sends to the phones with the Nanit app, and publishes each one within seconds:

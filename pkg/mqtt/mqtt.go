@@ -2,11 +2,13 @@ package mqtt
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	MQTT "github.com/eclipse/paho.mqtt.golang"
+	"github.com/indiefan/home_assistant_nanit/pkg/activity"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 	"github.com/indiefan/home_assistant_nanit/pkg/push"
 	"github.com/indiefan/home_assistant_nanit/pkg/utils"
@@ -295,4 +297,39 @@ func notificationDiscovery(b baby.Baby, stateTopic string) (topic string, payloa
 	})
 
 	return fmt.Sprintf("homeassistant/event/%v/notification/config", id), payload, err
+}
+
+// PublishActivity publishes an event of the activity list of the Nanit
+// service to the topic for the events of the baby. It returns an error
+// when the broker has not confirmed the message, so that the caller can
+// publish it again later. The receiver can therefore get an event more
+// than once, and must go by its uid.
+func (conn *Connection) PublishActivity(babyUID string, event activity.Event, backfill bool) error {
+	payload, err := activityPayload(event, backfill)
+	if err != nil {
+		return err
+	}
+
+	topic := fmt.Sprintf("%v/babies/%v/event", conn.Opts.TopicPrefix, babyUID)
+
+	token := conn.client.Publish(topic, 1, false, payload)
+	if !token.WaitTimeout(publishTimeout) {
+		return errors.New("the broker did not confirm the message in time")
+	}
+
+	return token.Error()
+}
+
+// activityPayload builds the message for an event of the activity list.
+func activityPayload(event activity.Event, backfill bool) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"uid":        event.UID,
+		"key":        event.Key,
+		"detail":     event.InternalKey,
+		"title":      event.Text(),
+		"time":       event.Time,
+		"created_at": event.CreatedAt,
+		"clip":       event.Clip,
+		"backfill":   backfill,
+	})
 }

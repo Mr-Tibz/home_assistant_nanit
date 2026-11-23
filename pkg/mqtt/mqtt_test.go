@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/indiefan/home_assistant_nanit/pkg/activity"
 	"github.com/indiefan/home_assistant_nanit/pkg/baby"
 	"github.com/indiefan/home_assistant_nanit/pkg/push"
 	"github.com/stretchr/testify/assert"
@@ -54,4 +55,28 @@ func TestNotificationOfAnUnknownBabyIsNotPublished(t *testing.T) {
 	// must not be tried for a baby that is not known
 	conn.PublishNotification(push.Notification{Type: "SOUND", BabyUID: "../other"})
 	conn.PublishNotification(push.Notification{Type: "SOUND"})
+}
+
+func TestActivityPayload(t *testing.T) {
+	payload, err := activityPayload(activity.Event{
+		UID: "c1b96daf28", Key: "VISIT", InternalKey: "VISIT_WOKE_UP", Title: "Parent approaching",
+		Time: 1791772138.97, CreatedAt: "2026-10-12T02:34:28Z", Clip: true,
+	}, true)
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"uid":"c1b96daf28","key":"VISIT","detail":"VISIT_WOKE_UP","title":"Parent approaching","time":1791772138.97,"created_at":"2026-10-12T02:34:28Z","clip":true,"backfill":true}`, string(payload))
+}
+
+// Motion and sound come from the service with their kind as the title
+func TestActivityPayloadOfMotion(t *testing.T) {
+	payload, err := activityPayload(activity.Event{UID: "7fa5814758", Key: "MOTION", InternalKey: "MOTION", Title: "MOTION", Time: 1791772000}, false)
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"uid":"7fa5814758","key":"MOTION","detail":"MOTION","title":"Motion","time":1791772000,"created_at":"","clip":false,"backfill":false}`, string(payload))
+}
+
+func TestPublishActivityReportsThatThereIsNoBroker(t *testing.T) {
+	conn := NewConnection(Opts{BrokerURL: "tcp://127.0.0.1:1", TopicPrefix: "nanit"})
+
+	assert.Error(t, conn.PublishActivity("abc123", activity.Event{UID: "7fa5814758", Key: "MOTION"}, false))
 }

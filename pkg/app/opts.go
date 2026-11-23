@@ -18,6 +18,10 @@ type Opts struct {
 
 	// Push - nil when the push notifications are not received
 	Push *PushOpts
+
+	// ActivityPolling - follow the activity list of the Nanit service
+	// and publish its events over MQTT
+	ActivityPolling bool
 }
 
 // PushOpts - options for the push notifications of the Nanit service
